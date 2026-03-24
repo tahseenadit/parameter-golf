@@ -70,6 +70,16 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # QLoRA (bitsandbytes NF4 Linear4bit + low-rank adapters on attention/MLP linears).
+    # Train the adapters (+ existing scalar/embedding/head splits); base matmul weights stay frozen in 4-bit.
+    # After training, adapters are merged into fp32 CastedLinear so int8 export matches the default script flow.
+    use_qlora = bool(int(os.environ.get("USE_QLORA", "1")))
+    lora_r = int(os.environ.get("LORA_R", "16"))
+    lora_alpha = int(os.environ.get("LORA_ALPHA", "32"))
+    lora_dropout = float(os.environ.get("LORA_DROPOUT", "0.0"))
+    lora_lr = float(os.environ.get("LORA_LR", "0.04"))
+    bnb_4bit_quant_type = os.environ.get("BNB_4BIT_QUANT_TYPE", "nf4")
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -513,6 +523,106 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class QLoRALinear(nn.Module):
+    """Frozen 4-bit linear (bitsandbytes) plus trainable LoRA."""
+
+    def __init__(
+        self,
+        linear4bit: nn.Module,
+        *,
+        r: int,
+        alpha: int,
+        dropout: float,
+    ):
+        super().__init__()
+        if r <= 0:
+            raise ValueError(f"lora r must be positive for QLoRALinear, got {r}")
+        self.base = linear4bit
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        in_f = int(linear4bit.in_features)
+        out_f = int(linear4bit.out_features)
+        self.lora_A = nn.Linear(in_f, r, bias=False, dtype=torch.bfloat16)
+        self.lora_B = nn.Linear(r, out_f, bias=False, dtype=torch.bfloat16)
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = self.base(x)
+        z = self.lora_dropout(x)
+        return out + self.lora_B(self.lora_A(z)) * self.scaling
+
+    def merge_to_casted_linear(self, quant_type: str) -> CastedLinear:
+        """Materialize a dense fp32 CastedLinear (dequantized base + LoRA) for export / compile-friendly eval."""
+        import bitsandbytes.functional as bnbF
+
+        w_param = self.base.weight
+        quant_state = getattr(w_param, "quant_state", None)
+        w_deq = bnbF.dequantize_4bit(w_param.data, quant_state=quant_state, quant_type=quant_type).float()
+        delta = (self.lora_B.weight.float() @ self.lora_A.weight.float()) * self.scaling
+        w_full = w_deq + delta
+        dev = w_full.device
+        has_bias = self.base.bias is not None
+        casted = CastedLinear(self.base.in_features, self.base.out_features, bias=has_bias).to(device=dev)
+        casted.weight.data.copy_(w_full)
+        if has_bias:
+            casted.bias.data.copy_(self.base.bias.data.float())
+        if getattr(self, "_zero_init", False):
+            casted._zero_init = True  # type: ignore[attr-defined]
+        return casted
+
+
+def make_projection_linear(
+    in_features: int,
+    out_features: int,
+    bias: bool,
+    *,
+    device: torch.device,
+    use_qlora: bool,
+    bnb_4bit_quant_type: str,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+    zero_init: bool,
+) -> nn.Module:
+    if not use_qlora:
+        m: nn.Module = CastedLinear(in_features, out_features, bias=bias)
+        if zero_init:
+            m._zero_init = True  # type: ignore[attr-defined]
+        return m
+
+    import bitsandbytes as bnb
+
+    fp = nn.Linear(in_features, out_features, bias=bias, device=device, dtype=torch.bfloat16)
+    if zero_init:
+        nn.init.zeros_(fp.weight)
+        if bias:
+            nn.init.zeros_(fp.bias)
+    else:
+        nn.init.kaiming_uniform_(fp.weight, a=math.sqrt(5))
+        if bias:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(fp.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(fp.bias, -bound, bound)
+    q = bnb.nn.Linear4bit.from_float(fp, quant_type=bnb_4bit_quant_type)
+    m = QLoRALinear(q, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    if zero_init:
+        m._zero_init = True  # type: ignore[attr-defined]
+    return m
+
+
+def merge_qlora_submodules(root: nn.Module, quant_type: str) -> None:
+    for name, child in list(root._modules.items()):
+        if child is None:
+            continue
+        if isinstance(child, QLoRALinear):
+            setattr(root, name, child.merge_to_casted_linear(quant_type))
+        else:
+            merge_qlora_submodules(child, quant_type)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -560,6 +670,12 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        device: torch.device,
+        use_qlora: bool,
+        bnb_4bit_quant_type: str,
+        lora_r: int,
+        lora_alpha: int,
+        lora_dropout: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,11 +688,26 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        self.c_q = make_projection_linear(
+            dim, dim, False,
+            device=device, use_qlora=use_qlora, bnb_4bit_quant_type=bnb_4bit_quant_type,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, zero_init=False,
+        )
+        self.c_k = make_projection_linear(
+            dim, kv_dim, False,
+            device=device, use_qlora=use_qlora, bnb_4bit_quant_type=bnb_4bit_quant_type,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, zero_init=False,
+        )
+        self.c_v = make_projection_linear(
+            dim, kv_dim, False,
+            device=device, use_qlora=use_qlora, bnb_4bit_quant_type=bnb_4bit_quant_type,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, zero_init=False,
+        )
+        self.proj = make_projection_linear(
+            dim, dim, False,
+            device=device, use_qlora=use_qlora, bnb_4bit_quant_type=bnb_4bit_quant_type,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, zero_init=True,
+        )
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -605,12 +736,29 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: int,
+        device: torch.device,
+        use_qlora: bool,
+        bnb_4bit_quant_type: str,
+        lora_r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+    ):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.fc = make_projection_linear(
+            dim, hidden, False,
+            device=device, use_qlora=use_qlora, bnb_4bit_quant_type=bnb_4bit_quant_type,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, zero_init=False,
+        )
+        self.proj = make_projection_linear(
+            hidden, dim, False,
+            device=device, use_qlora=use_qlora, bnb_4bit_quant_type=bnb_4bit_quant_type,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, zero_init=True,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -626,12 +774,24 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        device: torch.device,
+        use_qlora: bool,
+        bnb_4bit_quant_type: str,
+        lora_r: int,
+        lora_alpha: int,
+        lora_dropout: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+            device, use_qlora, bnb_4bit_quant_type, lora_r, lora_alpha, lora_dropout,
+        )
+        self.mlp = MLP(
+            dim, mlp_mult,
+            device, use_qlora, bnb_4bit_quant_type, lora_r, lora_alpha, lora_dropout,
+        )
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +819,12 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        device: torch.device,
+        use_qlora: bool = False,
+        bnb_4bit_quant_type: str = "nf4",
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +832,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.use_qlora = use_qlora
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +847,12 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    device,
+                    use_qlora,
+                    bnb_4bit_quant_type,
+                    lora_r,
+                    lora_alpha,
+                    lora_dropout,
                 )
                 for i in range(num_layers)
             ]
@@ -823,6 +996,14 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    if args.use_qlora:
+        try:
+            import bitsandbytes  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "USE_QLORA=1 requires the bitsandbytes package (pip install bitsandbytes)."
+            ) from e
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -835,12 +1016,26 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        device=device,
+        use_qlora=args.use_qlora,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.use_qlora:
+        # torch.compile does not support bitsandbytes 4-bit matmul paths reliably.
+        compiled_model = base_model
+        log0(
+            f"qlora:enabled r={args.lora_r} alpha={args.lora_alpha} dropout={args.lora_dropout} "
+            f"quant_type={args.bnb_4bit_quant_type} lora_lr={args.lora_lr} torch_compile=disabled"
+        )
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -849,11 +1044,20 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    if args.use_qlora:
+        matrix_params: list[Tensor] = []
+        lora_param_list = [
+            p
+            for name, p in block_named_params
+            if p.requires_grad and ("lora_A" in name or "lora_B" in name)
+        ]
+    else:
+        lora_param_list = []
+        matrix_params = [
+            p
+            for name, p in block_named_params
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
     scalar_params = [
         p
         for name, p in block_named_params
@@ -861,6 +1065,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if args.use_qlora:
+        scalar_params = [p for p in scalar_params if p.requires_grad]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -868,21 +1074,36 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+    optimizer_muon: Muon | None = None
+    optimizer_lora: torch.optim.Optimizer | None = None
+    if args.use_qlora:
+        optimizer_lora = torch.optim.Adam(
+            [{"params": lora_param_list, "lr": args.lora_lr, "base_lr": args.lora_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+    else:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if args.use_qlora:
+        assert optimizer_lora is not None
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_lora, optimizer_scalar]
+    else:
+        assert optimizer_muon is not None
+        optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -900,7 +1121,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{0.0 if args.use_qlora else args.matrix_lr} "
+        f"lora_lr:{args.lora_lr if args.use_qlora else 0.0} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1018,10 +1240,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if optimizer_muon is not None:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1058,6 +1281,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if args.use_qlora:
+        merge_qlora_submodules(base_model, args.bnb_4bit_quant_type)
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(base_model)
+        log0("qlora:merged_adapters_into_dense_linears for export")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
