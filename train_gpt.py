@@ -894,7 +894,13 @@ def quantize_int4_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor,
         amax = t32.abs().max().item()
         scale = torch.tensor(amax / 7.0 if amax > 0 else 1.0, dtype=torch.float16)
         q = torch.clamp(torch.round(t32 / scale.float()), -8, 7).to(torch.int8)
-        return q, scale
+        # Pack single value: since ndim !=2, probably small, but to pack, pad to even
+        if q.numel() % 2 == 1:
+            q = torch.cat([q.flatten(), torch.tensor([0], dtype=torch.int8)]).view(q.shape)
+        q_u = (q + 8).to(torch.uint8)
+        packed = (q_u.view(-1)[::2] << 4) | q_u.view(-1)[1::2]
+        packed = packed.view(q.shape[:-1] + (q.shape[-1] // 2,))
+        return packed, scale
     nrows, ncols = t32.shape
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
@@ -910,7 +916,13 @@ def quantize_int4_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor,
     q_full = q_blocks.view(nrows, ncols_p)
     if pad:
         q_full = q_full[:, :ncols]
-    return q_full.contiguous(), scale.contiguous()
+    # Now pack q_full (int8 -8..7) into uint8, 2 values per byte
+    pad2 = (2 - q_full.shape[1] % 2) % 2
+    if pad2:
+        q_full = F.pad(q_full, (0, pad2), value=0)  # pad with 0 (which is -8 +8 =0 in uint8)
+    q_u = (q_full + 8).to(torch.uint8)
+    packed = (q_u[:, ::2] << 4) | q_u[:, 1::2]
+    return packed.contiguous(), scale.contiguous()
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], block_size: int = 64):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
@@ -961,10 +973,17 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             if orig.ndim == 2:
                 nrows, ncols = orig.shape
                 pad = (bs - ncols % bs) % bs
-                qf = q.float()
+                ncols_p = ncols + pad
+                # Unpack packed uint8 to int8 -8..7
+                packed = q  # uint8, shape (nrows, ncols_p // 2 + (pad2//2))
+                # Since we padded to even, ncols_p % 2 == 0, packed.shape[1] == ncols_p // 2
+                q_u = torch.empty(nrows, ncols_p, dtype=torch.uint8)
+                q_u[:, ::2] = (packed >> 4) & 0xF
+                q_u[:, 1::2] = packed & 0xF
+                qf = q_u.to(torch.int8).float() - 8.0
                 if pad:
-                    qf = F.pad(qf, (0, pad))
-                nblocks = qf.shape[1] // bs
+                    qf = qf[:, :ncols]
+                nblocks = ncols_p // bs
                 if s.shape != (nrows, nblocks):
                     raise RuntimeError(f"int4_block scale shape {tuple(s.shape)} != {(nrows, nblocks)} for {name}")
                 qb = qf.view(nrows, nblocks, bs)
@@ -973,8 +992,16 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             elif orig.ndim == 1:
                 n = orig.shape[0]
                 pad = (bs - n % bs) % bs
-                qf = F.pad(q.float().unsqueeze(0), (0, pad))
-                nblocks = qf.shape[1] // bs
+                n_p = n + pad
+                # Unpack
+                packed = q  # uint8, shape (1, n_p // 2)
+                q_u = torch.empty(1, n_p, dtype=torch.uint8)
+                q_u[0, ::2] = (packed[0] >> 4) & 0xF
+                q_u[0, 1::2] = packed[0] & 0xF
+                qf = q_u.to(torch.int8).float() - 8.0
+                if pad:
+                    qf = qf[:, :n]
+                nblocks = n_p // bs
                 s1 = s.view(-1) if s.ndim == 2 and s.shape[0] == 1 else s
                 if s1.shape[0] != nblocks:
                     raise RuntimeError(f"int4_block scale len {s1.shape[0]} != {nblocks} for {name}")
@@ -982,7 +1009,17 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                 recon = (qb * s1.float().unsqueeze(0).unsqueeze(-1)).view(-1)[:n]
                 out[name] = recon.to(orig_dtype)
             else:
-                out[name] = (q.float() * float(s.reshape(-1)[0].item())).to(orig_dtype)
+                # For other dims, unpack single
+                packed = q
+                q_u = torch.empty_like(orig, dtype=torch.uint8)
+                flat = q_u.view(-1)
+                packed_flat = packed.view(-1)
+                flat[::2] = (packed_flat >> 4) & 0xF
+                if flat.numel() % 2 == 1:
+                    flat = flat[:-1]  # remove padded
+                flat[1::2] = packed_flat & 0xF
+                qf = flat.view(q_u.shape).to(torch.int8).float() - 8.0
+                out[name] = (qf * float(s.reshape(-1)[0].item())).to(orig_dtype)
             continue
         elif isinstance(info, dict) and info.get("type") == "int6":
             if s.ndim > 0:
@@ -1355,12 +1392,16 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"}, block_size=args.gptq_block_size)
-    log0(f"gptq_lite:int4_blockwise block_size:{args.gptq_block_size}")
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
+    sd = {k: v.detach() for k, v in export_sd.items()}  # keep on GPU
+    if master_process:
+        quant_result, quant_meta = mixed_quantize_int6(sd, {"mlp", "attn"}, block_size=args.gptq_block_size)
+        log0(f"gptq_lite:int4_blockwise block_size:{args.gptq_block_size}")
+        quant_buf = io.BytesIO()
+        torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        log0(f"quantized model size: {len(quant_raw)} bytes")
+    else:
+        quant_raw = b""
     quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
