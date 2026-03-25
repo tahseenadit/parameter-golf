@@ -1393,6 +1393,7 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
     sd = {k: v.detach() for k, v in export_sd.items()}  # keep on GPU
+    template_sd = {k: v.detach().to("cpu").contiguous() for k, v in export_sd.items()}
     if master_process:
         quant_result, quant_meta = mixed_quantize_int6(sd, {"mlp", "attn"}, block_size=args.gptq_block_size)
         log0(f"gptq_lite:int4_blockwise block_size:{args.gptq_block_size}")
@@ -1419,7 +1420,7 @@ def main() -> None:
         io.BytesIO(zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _COMPRESSOR == "zstd" else zlib.decompress(quant_blob_disk)),
         map_location="cpu",
     )
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], template_sd)
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
