@@ -84,7 +84,7 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
-    # GPTQ-lite (attn/mlp): 4-bit block-wise quant along each row; each block has its own scale from max |w| in that block.
+    # GPTQ-lite (attn/mlp): int6 block-wise quant along each row (matches QAT: /31, clamp -32..31); last block may be shorter.
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -884,46 +884,73 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
-def quantize_int4_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor, Tensor]:
-    """4-bit symmetric-ish grid -8..7 per block; scale = (max abs in block) / 7 (independent per block, per row)."""
+def _dequantize_int6_block_rowwise(
+    q: Tensor,
+    scales: Tensor,
+    nrows: int,
+    ncols: int,
+    block_size: int,
+) -> Tensor:
+    """int8 q (nrows, ncols) × per-block scales (nrows, nblocks); variable-width tail (no column padding)."""
+    if ncols <= 0:
+        return torch.empty(nrows, 0, dtype=torch.float32, device=q.device)
+    qf = q.float()
+    if qf.shape != (nrows, ncols):
+        raise RuntimeError(f"q shape {tuple(qf.shape)} != ({nrows},{ncols})")
+    nfull, rem = ncols // block_size, ncols % block_size
+    nblocks_k = nfull + (1 if rem else 0)
+    if scales.shape != (nrows, nblocks_k):
+        raise RuntimeError(
+            f"scale shape {tuple(scales.shape)} != ({nrows},{nblocks_k}) for ncols={ncols} bs={block_size}"
+        )
+    idx = 0
+    parts: list[Tensor] = []
+    for bi in range(nblocks_k):
+        bw = block_size if (rem == 0 or bi < nfull) else rem
+        parts.append(qf[:, idx : idx + bw] * scales[:, bi : bi + 1].float())
+        idx += bw
+    return torch.cat(parts, dim=1)
+
+
+def quantize_int6_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor, Tensor]:
+    """Int6 per block (same grid as QAT CastedLinear: scale = max_abs/31, q in [-32, 31]). Last block may be shorter."""
     t32 = t.float()
+    div = 31.0
+    qmin, qmax = -32, 31
     if t32.ndim == 1:
-        q2, s2 = quantize_int4_blockwise_per_row(t32.unsqueeze(0), block_size)
+        q2, s2 = quantize_int6_blockwise_per_row(t32.unsqueeze(0), block_size)
         return q2.squeeze(0), s2.squeeze(0)
     if t32.ndim != 2:
         amax = t32.abs().max().item()
-        scale = torch.tensor(amax / 7.0 if amax > 0 else 1.0, dtype=torch.float16)
-        q = torch.clamp(torch.round(t32 / scale.float()), -8, 7).to(torch.int8)
-        # Pack single value: since ndim !=2, probably small, but to pack, pad to even
-        if q.numel() % 2 == 1:
-            q = torch.cat([q.flatten(), torch.tensor([0], dtype=torch.int8)]).view(q.shape)
-        q_u = (q + 8).to(torch.uint8)
-        packed = (q_u.view(-1)[::2] << 4) | q_u.view(-1)[1::2]
-        packed = packed.view(q.shape[:-1] + (q.shape[-1] // 2,))
-        return packed, scale
+        scale = torch.tensor(amax / div if amax > 0 else 1.0, dtype=torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()), qmin, qmax).to(torch.int8)
+        return q.contiguous(), scale
     nrows, ncols = t32.shape
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
-    pad = (block_size - ncols % block_size) % block_size
-    if pad:
-        t32 = F.pad(t32, (0, pad))
-    ncols_p = t32.shape[1]
-    nblocks = ncols_p // block_size
-    blocks = t32.view(nrows, nblocks, block_size)
-    max_abs = blocks.abs().amax(dim=2).clamp_min(1e-8)
-    scale = (max_abs / 7.0).to(torch.float16)
-    q_blocks = torch.round(blocks / scale.float().unsqueeze(-1)).clamp(-8, 7).to(torch.int8)
-    q_full = q_blocks.view(nrows, ncols_p)
-    if pad:
-        q_full = q_full[:, :ncols]
-    # Now pack q_full (int8 -8..7) into uint8, 2 values per byte
-    pad2 = (2 - q_full.shape[1] % 2) % 2
-    if pad2:
-        q_full = F.pad(q_full, (0, pad2), value=0)  # pad with 0 (which is -8 +8 =0 in uint8)
-    q_u = (q_full + 8).to(torch.uint8)
-    packed = (q_u[:, ::2] << 4) | q_u[:, 1::2]
-    return packed.contiguous(), scale.contiguous()
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], block_size: int = 64):
+    col_widths: list[int] = []
+    c = 0
+    while c < ncols:
+        col_widths.append(min(block_size, ncols - c))
+        c += col_widths[-1]
+    scales_list: list[Tensor] = []
+    q_list: list[Tensor] = []
+    for blk in torch.split(t32, col_widths, dim=1):
+        max_abs = blk.abs().amax(dim=1).clamp_min(1e-8)
+        sc = (max_abs / div).clamp_min(1.0 / div).to(torch.float16)
+        qb = torch.round(blk / sc.float().unsqueeze(-1)).clamp(qmin, qmax).to(torch.int8)
+        scales_list.append(sc)
+        q_list.append(qb)
+    scale = torch.stack(scales_list, dim=1)
+    q_full = torch.cat(q_list, dim=1)
+    return q_full.contiguous(), scale.contiguous()
+
+
+def mixed_quantize_int6(
+    state_dict: dict[str, Tensor],
+    int6_cats: set[str],
+    block_size: int = 64,
+):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
@@ -943,10 +970,13 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], bloc
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int4_blockwise_per_row(t, block_size)
+            q, s = quantize_int6_blockwise_per_row(t, block_size)
+            meta[name] = {
+                "type": "int6_block",
+                "block_size": block_size if t.ndim in (1, 2) else 0,
+            }
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int4_block", "block_size": block_size}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -968,58 +998,23 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = t
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
-        if isinstance(info, dict) and info.get("type") == "int4_block":
+        if isinstance(info, dict) and info.get("type") == "int6_block":
             bs = int(info["block_size"])
+            if bs <= 0:
+                out[name] = (q.float() * float(s.reshape(-1)[0].item())).to(orig_dtype)
+                continue
             if orig.ndim == 2:
                 nrows, ncols = orig.shape
-                pad = (bs - ncols % bs) % bs
-                ncols_p = ncols + pad
-                # Unpack packed uint8 to int8 -8..7
-                packed = q  # uint8, shape (nrows, ncols_p // 2 + (pad2//2))
-                # Since we padded to even, ncols_p % 2 == 0, packed.shape[1] == ncols_p // 2
-                q_u = torch.empty(nrows, ncols_p, dtype=torch.uint8)
-                q_u[:, ::2] = (packed >> 4) & 0xF
-                q_u[:, 1::2] = packed & 0xF
-                qf = q_u.to(torch.int8).float() - 8.0
-                if pad:
-                    qf = qf[:, :ncols]
-                nblocks = ncols_p // bs
-                if s.shape != (nrows, nblocks):
-                    raise RuntimeError(f"int4_block scale shape {tuple(s.shape)} != {(nrows, nblocks)} for {name}")
-                qb = qf.view(nrows, nblocks, bs)
-                recon = (qb * s.float().unsqueeze(-1)).view(nrows, -1)[:, :ncols]
+                recon = _dequantize_int6_block_rowwise(q, s, nrows, ncols, bs)
                 out[name] = recon.to(orig_dtype)
             elif orig.ndim == 1:
                 n = orig.shape[0]
-                pad = (bs - n % bs) % bs
-                n_p = n + pad
-                # Unpack
-                packed = q  # uint8, shape (1, n_p // 2)
-                q_u = torch.empty(1, n_p, dtype=torch.uint8)
-                q_u[0, ::2] = (packed[0] >> 4) & 0xF
-                q_u[0, 1::2] = packed[0] & 0xF
-                qf = q_u.to(torch.int8).float() - 8.0
-                if pad:
-                    qf = qf[:, :n]
-                nblocks = n_p // bs
-                s1 = s.view(-1) if s.ndim == 2 and s.shape[0] == 1 else s
-                if s1.shape[0] != nblocks:
-                    raise RuntimeError(f"int4_block scale len {s1.shape[0]} != {nblocks} for {name}")
-                qb = qf.view(1, nblocks, bs)
-                recon = (qb * s1.float().unsqueeze(0).unsqueeze(-1)).view(-1)[:n]
+                qq = q.unsqueeze(0) if q.ndim == 1 else q
+                ss = s.unsqueeze(0) if s.ndim == 1 else s
+                recon = _dequantize_int6_block_rowwise(qq, ss, 1, n, bs).squeeze(0)
                 out[name] = recon.to(orig_dtype)
             else:
-                # For other dims, unpack single
-                packed = q
-                q_u = torch.empty_like(orig, dtype=torch.uint8)
-                flat = q_u.view(-1)
-                packed_flat = packed.view(-1)
-                flat[::2] = (packed_flat >> 4) & 0xF
-                if flat.numel() % 2 == 1:
-                    flat = flat[:-1]  # remove padded
-                flat[1::2] = packed_flat & 0xF
-                qf = flat.view(q_u.shape).to(torch.int8).float() - 8.0
-                out[name] = (qf * float(s.reshape(-1)[0].item())).to(orig_dtype)
+                out[name] = (q.float() * float(s.reshape(-1)[0].item())).to(orig_dtype)
             continue
         elif isinstance(info, dict) and info.get("type") == "int6":
             if s.ndim > 0:
@@ -1396,7 +1391,7 @@ def main() -> None:
     template_sd = {k: v.detach().to("cpu").contiguous() for k, v in export_sd.items()}
     if master_process:
         quant_result, quant_meta = mixed_quantize_int6(sd, {"mlp", "attn"}, block_size=args.gptq_block_size)
-        log0(f"gptq_lite:int4_blockwise block_size:{args.gptq_block_size}")
+        log0(f"gptq_lite:int6_blockwise block_size:{args.gptq_block_size}")
         quant_buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
         quant_raw = quant_buf.getvalue()
