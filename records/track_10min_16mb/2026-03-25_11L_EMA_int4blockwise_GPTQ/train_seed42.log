@@ -1,0 +1,5 @@
+# PLACEHOLDER — replace with full automatic training log for SEED=42
+# Suggested command (same as seed 1337 but):
+# SEED=42 RUN_ID=record_seed42 DATA_PATH=... TOKENIZER_PATH=... VOCAB_SIZE=1024 MAX_WALLCLOCK_SECONDS=600 \
+#   torchrun --standalone --nproc_per_node=8 train_gpt.py
+# Then copy logs/<RUN_ID>.txt here.

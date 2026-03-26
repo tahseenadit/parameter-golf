@@ -1,0 +1,10 @@
+{
+  "author": "[YOUR NAME — replace before PR]",
+  "github_id": "[YOUR GITHUB USERNAME — replace before PR]",
+  "name": "Record: 11L EMA + int4 blockwise GPTQ-lite (B=64)",
+  "blurb": "Fork of 2026-03-22 GPTQ-lite: 4-bit blockwise per-row quant (GPTQ_BLOCK_SIZE=64) replaces int6 percentile clip search. Same training (EMA 0.997, SWA, late QAT 0.15, 600s/8xH100). Provisional entry: val_bpb/val_loss from SEED=1337 sliding s64 only; update after 3-seed mean (42, 2042) and replace author/github_id.",
+  "date": "2026-03-25T00:00:00Z",
+  "val_loss": 1.94374691,
+  "val_bpb": 1.15119946,
+  "bytes_total": 13299534
+}

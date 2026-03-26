@@ -1,0 +1,80 @@
+# Full training log for SEED=1337 — replace/append if your local file is longer.
+# Command: RUN_ID=baseline_sp1024 DATA_PATH=... TOKENIZER_PATH=... VOCAB_SIZE=1024 torchrun --standalone --nproc_per_node=8 train_gpt.py
+
+logs/baseline_sp1024.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:26993756
+mtp_num_heads:0 mtp_loss_weight:0.2 mtp_params:0
+XSA:last_4 active_layers:[7, 8, 9, 10]
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.035 head_lr:0.0 matrix_lr:0.025 scalar_lr:0.025
+train_batch_tokens:786432 train_seq_len:2048 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9279 val_bpb:4.1031 train_time:0ms step_avg:0.01ms
+step:1/20000 train_loss:6.9299 train_time:137ms step_avg:136.84ms
+step:2/20000 train_loss:8.5642 train_time:219ms step_avg:109.75ms
+step:3/20000 train_loss:7.8180 train_time:303ms step_avg:101.02ms
+step:4/20000 train_loss:7.2359 train_time:386ms step_avg:96.53ms
+step:5/20000 train_loss:7.0664 train_time:469ms step_avg:93.89ms
+step:6/20000 train_loss:6.8297 train_time:552ms step_avg:92.07ms
+step:7/20000 train_loss:6.7203 train_time:636ms step_avg:90.83ms
+step:8/20000 train_loss:6.7478 train_time:719ms step_avg:89.86ms
+step:9/20000 train_loss:6.4050 train_time:802ms step_avg:89.09ms
+step:10/20000 train_loss:6.0804 train_time:885ms step_avg:88.50ms
+step:500/20000 train_loss:2.4049 train_time:43654ms step_avg:87.31ms
+step:1000/20000 train_loss:2.2749 train_time:87540ms step_avg:87.54ms
+step:1500/20000 train_loss:2.2185 train_time:131470ms step_avg:87.65ms
+step:2000/20000 train_loss:2.0583 train_time:175543ms step_avg:87.77ms
+step:2500/20000 train_loss:2.1586 train_time:219452ms step_avg:87.78ms
+step:3000/20000 train_loss:2.1538 train_time:263127ms step_avg:87.71ms
+step:3500/20000 train_loss:2.1716 train_time:306880ms step_avg:87.68ms
+step:4000/20000 train_loss:1.9635 train_time:350684ms step_avg:87.67ms
+step:4000/20000 val_loss:2.0536 val_bpb:1.2163 train_time:350689ms step_avg:87.67ms
+step:4500/20000 train_loss:2.1134 train_time:394362ms step_avg:87.64ms
+step:5000/20000 train_loss:2.0933 train_time:438087ms step_avg:87.62ms
+step:5500/20000 train_loss:2.0079 train_time:481838ms step_avg:87.61ms
+step:6000/20000 train_loss:1.9313 train_time:525500ms step_avg:87.58ms
+swa:start step:6200
+late_qat:enabled step:6328 scale:0.1497
+step:6500/20000 train_loss:2.0685 train_time:569373ms step_avg:87.60ms
+step:6851/20000 val_loss:1.9256 val_bpb:1.1405 train_time:600008ms step_avg:87.58ms
+stopping_early: wallclock_cap train_time:600008ms step:6851/20000
+peak memory allocated: 20673 MiB reserved: 20718 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:1.9240 val_bpb:1.1395 eval_time:1981ms
+Serialized model: 106178569 bytes
+Code size: 72313 bytes
+gptq_lite:int4_blockwise block_size:64
+quantized model size: 15022787 bytes
+Serialized model int6+zlib: 13227221 bytes
+Total submission size int6+zlib: 13299534 bytes
+Total submission size int8+zlib: 13299534 bytes
+final_int6_roundtrip val_loss:1.9838 val_bpb:1.1749 eval_time:37822ms
+final_int6_roundtrip_exact val_loss:1.98383571 val_bpb:1.17493925
+final_int6_sliding_window val_loss:1.9437 val_bpb:1.1512 stride:64 eval_time:92224ms
+final_int6_sliding_window_exact val_loss:1.94374691 val_bpb:1.15119946
+final_int8_zlib_roundtrip_exact val_loss:1.94374691 val_bpb:1.15119946

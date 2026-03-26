@@ -1,0 +1,2 @@
+# Canonical alias: primary submitted run log is train_seed1337.log for this WIP record.
+# After 3-seed sweep, either symlink train.log -> train_seed1337.log (best seed) or paste combined summary here.
