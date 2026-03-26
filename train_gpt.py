@@ -84,7 +84,7 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
-    # GPTQ-lite (attn/mlp): int6 block-wise quant along each row (matches QAT: /31, clamp -32..31); last block may be shorter.
+    # Export: int4 blockwise (nibble-packed) for attn+MLP linears; tok_emb/lm_head/other large mats → int8; small/control → FP16/FP32 passthrough.
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -585,7 +585,7 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 class Block(nn.Module):
     def __init__(
@@ -884,6 +884,81 @@ def _classify_param(name: str) -> str:
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
         return "attn"
     return "other"
+
+
+def _dequantize_int4_block_packed_rowwise(
+    packed: Tensor,
+    scales: Tensor,
+    nrows: int,
+    ncols: int,
+    block_size: int,
+) -> Tensor:
+    """Unpack nibble-packed int4 (-8..7) row blocks × per-block scales; variable-width tail (no column pad)."""
+    if ncols <= 0:
+        return torch.empty(nrows, 0, dtype=torch.float32, device=packed.device)
+    pad2 = (2 - ncols % 2) % 2
+    nwide = ncols + pad2
+    if packed.shape != (nrows, nwide // 2):
+        raise RuntimeError(
+            f"packed shape {tuple(packed.shape)} != ({nrows},{nwide // 2}) for ncols={ncols}"
+        )
+    q_u = torch.empty(nrows, nwide, dtype=torch.uint8, device=packed.device)
+    q_u[:, ::2] = (packed >> 4) & 0xF
+    q_u[:, 1::2] = packed & 0xF
+    qf = q_u.to(torch.float32) - 8.0
+    qf = qf[:, :ncols]
+    nfull, rem = ncols // block_size, ncols % block_size
+    nblocks_k = nfull + (1 if rem else 0)
+    if scales.shape != (nrows, nblocks_k):
+        raise RuntimeError(
+            f"scale shape {tuple(scales.shape)} != ({nrows},{nblocks_k}) for ncols={ncols} bs={block_size}"
+        )
+    idx = 0
+    parts: list[Tensor] = []
+    for bi in range(nblocks_k):
+        bw = block_size if (rem == 0 or bi < nfull) else rem
+        parts.append(qf[:, idx : idx + bw] * scales[:, bi : bi + 1].float())
+        idx += bw
+    return torch.cat(parts, dim=1)
+
+
+def quantize_int4_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor, Tensor]:
+    """Int4 per block: scale = max_abs/7, q in [-8,7]; last block may be shorter. 2D rows are nibble-packed (uint8)."""
+    t32 = t.float()
+    if t32.ndim == 1:
+        q2, s2 = quantize_int4_blockwise_per_row(t32.unsqueeze(0), block_size)
+        return q2.squeeze(0), s2.squeeze(0)
+    if t32.ndim != 2:
+        amax = t32.abs().max().item()
+        scale = torch.tensor(amax / 7.0 if amax > 0 else 1.0, dtype=torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()), -8, 7).to(torch.int8)
+        return q.contiguous(), scale
+    nrows, ncols = t32.shape
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    col_widths: list[int] = []
+    c = 0
+    while c < ncols:
+        col_widths.append(min(block_size, ncols - c))
+        c += col_widths[-1]
+    scales_list: list[Tensor] = []
+    q_list: list[Tensor] = []
+    for blk in torch.split(t32, col_widths, dim=1):
+        max_abs = blk.abs().amax(dim=1).clamp_min(1e-8)
+        sc = (max_abs / 7.0).to(torch.float16)
+        qb = torch.round(blk / sc.float().unsqueeze(-1)).clamp(-8, 7).to(torch.int8)
+        scales_list.append(sc)
+        q_list.append(qb)
+    scale = torch.stack(scales_list, dim=1)
+    q_full = torch.cat(q_list, dim=1)
+    pad2 = (2 - q_full.shape[1] % 2) % 2
+    if pad2:
+        q_full = F.pad(q_full, (0, pad2), value=0)
+    q_u = (q_full + 8).to(torch.uint8)
+    packed = (q_u[:, ::2] << 4) | q_u[:, 1::2]
+    return packed.contiguous(), scale.contiguous()
+
+
 def _dequantize_int6_block_rowwise(
     q: Tensor,
     scales: Tensor,
@@ -948,14 +1023,16 @@ def quantize_int6_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor,
 
 def mixed_quantize_int6(
     state_dict: dict[str, Tensor],
-    int6_cats: set[str],
+    int4_linear_cats: set[str],
     block_size: int = 64,
 ):
-    num_layers_total = max(
-        (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
-        default=0,
-    ) + 1
-    late_k_layers = set(range(num_layers_total - 2, num_layers_total))
+    """Export mix: int4 blockwise (nibble-packed) for large attn/MLP linears; int8 elsewhere.
+
+    - attn / MLP weight matrices (``int4_linear_cats``): uniform int4 per row with block column scales.
+    - tok_emb / lm_head / other large tensors: per-row (or scalar) int8 via ``quantize_float_tensor``.
+    - Small tensors (≤65k elems): stored as FP16 passthrough.
+    - Control / sensitive scalars (``CONTROL_TENSOR_NAME_PATTERNS``): FP32 passthrough.
+    """
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -969,10 +1046,10 @@ def mixed_quantize_int6(
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_blockwise_per_row(t, block_size)
+        if cat in int4_linear_cats and t.ndim >= 1:
+            q, s = quantize_int4_blockwise_per_row(t, block_size)
             meta[name] = {
-                "type": "int6_block",
+                "type": "int4_block",
                 "block_size": block_size if t.ndim in (1, 2) else 0,
             }
             result[name + ".q"] = q
@@ -985,6 +1062,7 @@ def mixed_quantize_int6(
     return result, meta
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                           template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Inverse of ``mixed_quantize_int6`` (int4_block + int8 + passthroughs)."""
     out: dict[str, Tensor] = {}
     for name, orig in template_sd.items():
         info = meta.get(name)
@@ -998,7 +1076,26 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = t
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
-        if isinstance(info, dict) and info.get("type") == "int6_block":
+        if isinstance(info, dict) and info.get("type") == "int4_block":
+            bs = int(info["block_size"])
+            if bs <= 0:
+                out[name] = (q.float() * float(s.reshape(-1)[0].item())).to(orig_dtype)
+                continue
+            packed = q.to(torch.uint8) if q.dtype != torch.uint8 else q
+            if orig.ndim == 2:
+                nrows, ncols = orig.shape
+                recon = _dequantize_int4_block_packed_rowwise(packed, s, nrows, ncols, bs)
+                out[name] = recon.to(orig_dtype)
+            elif orig.ndim == 1:
+                n = orig.shape[0]
+                pq = packed.unsqueeze(0) if packed.ndim == 1 else packed
+                ss = s.unsqueeze(0) if s.ndim == 1 else s
+                recon = _dequantize_int4_block_packed_rowwise(pq, ss, 1, n, bs).squeeze(0)
+                out[name] = recon.to(orig_dtype)
+            else:
+                out[name] = (q.float() * float(s.reshape(-1)[0].item())).to(orig_dtype)
+            continue
+        elif isinstance(info, dict) and info.get("type") == "int6_block":
             bs = int(info["block_size"])
             if bs <= 0:
                 out[name] = (q.float() * float(s.reshape(-1)[0].item())).to(orig_dtype)
@@ -1391,7 +1488,7 @@ def main() -> None:
     template_sd = {k: v.detach().to("cpu").contiguous() for k, v in export_sd.items()}
     if master_process:
         quant_result, quant_meta = mixed_quantize_int6(sd, {"mlp", "attn"}, block_size=args.gptq_block_size)
-        log0(f"gptq_lite:int6_blockwise block_size:{args.gptq_block_size}")
+        log0(f"gptq_lite:int4_blockwise block_size:{args.gptq_block_size}")
         quant_buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
         quant_raw = quant_buf.getvalue()
@@ -1400,16 +1497,15 @@ def main() -> None:
         quant_raw = b""
     quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw) if _COMPRESSOR == "zstd" else zlib.compress(quant_raw, 9)
     if master_process:
-        with open("final_model.int6.ptz", "wb") as f:
+        with open("final_model.int4.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int4+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Total submission size int4+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
     if distributed:
         dist.barrier()
-    with open("final_model.int6.ptz", "rb") as f:
+    with open("final_model.int4.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
         io.BytesIO(zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _COMPRESSOR == "zstd" else zlib.decompress(quant_blob_disk)),
@@ -1442,10 +1538,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int4_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int4_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
@@ -1458,11 +1554,11 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"final_int4_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
-        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        log0(f"final_int4_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        log0(f"final_int4_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
@@ -1474,11 +1570,11 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
+            f"final_int4_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
             f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
         )
-        log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        log0(f"final_int4_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        log0(f"final_int4_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
