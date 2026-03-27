@@ -735,12 +735,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         # No CastedLinear -- weights come from banks
-        # Learnable negative-slope (PReLU). Scalar works for any input shape (..., hidden).
-        self.prelu_a = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.linear(x, up_w.to(x.dtype))
-        a = self.prelu_a.to(dtype=x.dtype)
-        x = torch.where(x >= 0, x, a * x)
+        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
 class Block(nn.Module):
