@@ -60,9 +60,11 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     # Export quantization (GPTQ-lite): int4 blockwise by default, with optional int6 on last layers.
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
-    gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "2"))
+    gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "0"))
+    gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "3"))
     gptq_int4_cats = set([s for s in os.environ.get("GPTQ_INT4_CATS", "mlp,attn").split(",") if s])
     gptq_int6_cats = set([s for s in os.environ.get("GPTQ_INT6_CATS", "mlp,attn").split(",") if s])
+    gptq_int8_cats = set([s for s in os.environ.get("GPTQ_INT8_CATS", "mlp,attn").split(",") if s])
     gptq_skip_name_patterns = tuple(
         s for s in os.environ.get("GPTQ_SKIP_NAME_PATTERNS", "").split(",") if s
     )
@@ -1493,6 +1495,8 @@ def mixed_quantize_int6(
     *,
     int6_cats: set[str] | None = None,
     last_n_int6: int = 0,
+    int8_cats: set[str] | None = None,
+    last_n_int8: int = 0,
     block_size: int = 64,
     skip_name_patterns: tuple[str, ...] = (),
 ):
@@ -1504,7 +1508,10 @@ def mixed_quantize_int6(
     meta: dict[str, object] = {}
     if int6_cats is None:
         int6_cats = set()
+    if int8_cats is None:
+        int8_cats = set()
     int6_layers = set(range(max(num_layers_total - max(last_n_int6, 0), 0), num_layers_total)) if last_n_int6 > 0 else set()
+    int8_layers = set(range(max(num_layers_total - max(last_n_int8, 0), 0), num_layers_total)) if last_n_int8 > 0 else set()
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
@@ -1523,8 +1530,14 @@ def mixed_quantize_int6(
             meta[name] = "passthrough_ctrl"
             continue
         li = _layer_index_from_name(name)
+        use_int8 = (li is not None and li in int8_layers and cat in int8_cats and t.ndim >= 1)
         use_int6 = (li is not None and li in int6_layers and cat in int6_cats and t.ndim >= 1)
-        if use_int6:
+        if use_int8:
+            q, s = quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
+        elif use_int6:
             q, s = quantize_int6_blockwise_per_row(t, block_size)
             result[name + ".q"] = q
             result[name + ".scale"] = s
@@ -2013,9 +2026,21 @@ def main() -> None:
         args.gptq_int4_cats,
         int6_cats=args.gptq_int6_cats,
         last_n_int6=args.gptq_last_n_int6,
+        int8_cats=args.gptq_int8_cats,
+        last_n_int8=args.gptq_last_n_int8,
         block_size=args.gptq_block_size,
         skip_name_patterns=args.gptq_skip_name_patterns,
     )
+    if master_process:
+        log0(
+            "export_quant:"
+            f" compressor={_COMPRESSOR}"
+            f" block_size={args.gptq_block_size}"
+            f" int4_cats={sorted(args.gptq_int4_cats)}"
+            f" int6_last_n={args.gptq_last_n_int6} int6_cats={sorted(args.gptq_int6_cats)}"
+            f" int8_last_n={args.gptq_last_n_int8} int8_cats={sorted(args.gptq_int8_cats)}"
+            f" skip_patterns={list(args.gptq_skip_name_patterns)}"
+        )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
