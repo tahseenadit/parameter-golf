@@ -58,11 +58,14 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
-    # Export quantization (GPTQ-lite): int4 blockwise by default, with optional int6 on last layers.
+    # Export quantization (GPTQ-lite) defaults:
+    # - last 2 layers attn+mlp kept as int8
+    # - remaining attn+mlp quantized as int6 blockwise
+    # - int4 disabled by default
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
-    gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "0"))
-    gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "3"))
-    gptq_int4_cats = set([s for s in os.environ.get("GPTQ_INT4_CATS", "mlp,attn").split(",") if s])
+    gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "999"))
+    gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "2"))
+    gptq_int4_cats = set([s for s in os.environ.get("GPTQ_INT4_CATS", "").split(",") if s])
     gptq_int6_cats = set([s for s in os.environ.get("GPTQ_INT6_CATS", "mlp,attn").split(",") if s])
     gptq_int8_cats = set([s for s in os.environ.get("GPTQ_INT8_CATS", "mlp,attn").split(",") if s])
     gptq_skip_name_patterns = tuple(
