@@ -59,12 +59,12 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     # Export quantization (GPTQ-lite) defaults:
-    # - last 2 layers attn+mlp kept as int8
-    # - remaining attn+mlp quantized as int6 blockwise
-    # - int4 disabled by default
-    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
+    # - block column size 32
+    # - attn+mlp all int6 blockwise (GPTQ_LAST_N_INT6>=NUM_LAYERS)
+    # - no int8 / int4 on those tensors unless env overrides
+    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "32"))
     gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "999"))
-    gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "2"))
+    gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "0"))
     gptq_int4_cats = set([s for s in os.environ.get("GPTQ_INT4_CATS", "").split(",") if s])
     gptq_int6_cats = set([s for s in os.environ.get("GPTQ_INT6_CATS", "mlp,attn").split(",") if s])
     gptq_int8_cats = set([s for s in os.environ.get("GPTQ_INT8_CATS", "mlp,attn").split(",") if s])
