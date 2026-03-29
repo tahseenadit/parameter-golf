@@ -81,6 +81,8 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    # Second sliding pass at stride 64 when eval_stride differs (usually off to save time).
+    sliding_eval_extra_s64 = bool(int(os.environ.get("SLIDING_EVAL_EXTRA_S64", "0")))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
@@ -375,6 +377,8 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -388,6 +392,7 @@ def eval_val(
     is_boundary_token_lut: Tensor,
     eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
+    """Non-sliding CE on full contexts: **transformer loss only** (`forward`), not mixture BPB."""
     seq_len = eval_seq_len or args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < seq_len:
@@ -1364,7 +1369,7 @@ def eval_val_sliding(
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
-    """Sliding window evaluation: each token scored with maximum context."""
+    """Sliding window: mixture uses `score_targets_mixed_nll` when enabled."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -2072,6 +2077,11 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.mixture_head_enabled:
+        log0(
+            "validation:eval_val during training = transformer CE only (not mixture BPB); "
+            "mixture BPB = final sliding eval"
+        )
     CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -2330,10 +2340,17 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
-            log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-            )
+            if args.mixture_head_enabled:
+                log0(
+                    f"step:{step}/{args.iterations} val_loss_transformer_ce:{val_loss:.4f} "
+                    f"val_bpb_transformer_ce:{val_bpb:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+            else:
+                log0(
+                    f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         if last_step:
@@ -2457,10 +2474,17 @@ def main() -> None:
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
-    log0(
-        f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
-    )
+    if args.mixture_head_enabled:
+        log0(
+            f"DIAGNOSTIC post_ema val_loss_transformer_ce:{diag_val_loss:.4f} "
+            f"val_bpb_transformer_ce:{diag_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
+        )
+    else:
+        log0(
+            f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
+        )
     full_state_dict = base_model.state_dict()
     export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
     excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
@@ -2576,11 +2600,20 @@ def main() -> None:
         eval_seq_len=effective_eval_seq_len,
     )
     torch.cuda.synchronize()
-    log0(
-        f"final_mixed_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_mixed_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.mixture_head_enabled:
+        log0(
+            f"final_quant_roundtrip val_loss_transformer_ce:{q_val_loss:.4f} val_bpb_transformer_ce:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(
+            f"final_quant_roundtrip_exact val_loss_transformer_ce:{q_val_loss:.8f} val_bpb_transformer_ce:{q_val_bpb:.8f}"
+        )
+    else:
+        log0(
+            f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
@@ -2592,12 +2625,13 @@ def main() -> None:
             eval_seq_len=sw_seq_len,
         )
         torch.cuda.synchronize()
+        tag = "final_sliding_mixture" if args.mixture_head_enabled else "final_sliding_transformer_ce"
         log0(
-            f"final_mixed_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"{tag} val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
-        log0(f"final_mixed_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-    if args.eval_stride != 64 and 64 < sw_seq_len:
+        log0(f"{tag}_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+    if args.sliding_eval_extra_s64 and args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
         sw64_val_loss, sw64_val_bpb = eval_val_sliding(
@@ -2607,11 +2641,12 @@ def main() -> None:
             eval_seq_len=sw_seq_len,
         )
         torch.cuda.synchronize()
+        tag64 = "final_sliding_mixture_s64" if args.mixture_head_enabled else "final_sliding_transformer_ce_s64"
         log0(
-            f"final_mixed_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
+            f"{tag64} val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
             f"stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms"
         )
-        log0(f"final_mixed_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+        log0(f"{tag64}_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
     # Legal score-first TTT (PR #461 recipe)
     if args.ttt_enabled:
         torch.cuda.synchronize()
@@ -2622,8 +2657,10 @@ def main() -> None:
             stride=args.eval_stride, log0=log0,
         )
         torch.cuda.synchronize()
-        log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
-             f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+        log0(
+            f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
         log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
