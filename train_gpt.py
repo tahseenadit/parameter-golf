@@ -954,6 +954,8 @@ class GPT(nn.Module):
             self.register_buffer("artifact_log_probs", torch.zeros(mixture_artifact_buckets, vocab_size))
             self.register_buffer("tok_is_ws", torch.zeros(vocab_size, dtype=torch.float32))
             self.register_buffer("tok_is_boundary", torch.zeros(vocab_size, dtype=torch.float32))
+            for p in self.mixture_gate.parameters():
+                p.requires_grad_(False)
         else:
             self.mixture_gate = None
         self._init_weights()
@@ -1115,30 +1117,12 @@ class GPT(nn.Module):
         return F.softmax(self.mixture_gate(feat), dim=-1)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        """Training loss: transformer CE only. Mixture (cache + artifact + gate) is eval-only in `forward_logits`."""
         x = self._forward_hidden(input_ids)
         logits_tr = self._lm_logits_from_hidden(x)
-        if not self.mixture_head_enabled:
-            logits = logits_tr.reshape(-1, logits_tr.size(-1))
-            targets = target_ids.reshape(-1)
-            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        else:
-            log_p_cache = self._prefix_unibi_log_probs(input_ids)
-            bucket = self._artifact_bucket_ids(input_ids)
-            log_p_art = self.artifact_log_probs[bucket]
-            alphas = self._mixture_alphas(x, logits_tr, input_ids, log_p_cache)
-            p_tr = F.softmax(logits_tr.float(), dim=-1)
-            p_ca = torch.exp(log_p_cache.float())
-            p_ar = torch.exp(log_p_art.float())
-            p_mix = (
-                alphas[..., 0:1] * p_tr + alphas[..., 1:2] * p_ca + alphas[..., 2:3] * p_ar
-            ).clamp_min(1e-30)
-            targets = target_ids.reshape(-1)
-            main_loss = -torch.log(
-                p_mix.reshape(-1, p_mix.size(-1))
-                .gather(1, targets.unsqueeze(1))
-                .squeeze(1)
-                .clamp_min(1e-30)
-            ).mean()
+        logits = logits_tr.reshape(-1, logits_tr.size(-1))
+        targets = target_ids.reshape(-1)
+        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
             mtp_loss_sum = x.new_zeros(())
@@ -1961,13 +1945,8 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    if args.mixture_head_enabled:
-        log0("mixture_head:enabled torch_compile=off (prefix n-gram cache + 3-way gate)")
-        compiled_model = base_model
-        model = base_model
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-        model = compiled_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model = compiled_model
 
     # Optimizer split:
     # - 4 parameter banks -> Muon (batched Newton-Schulz)
@@ -2002,8 +1981,6 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
-    if base_model.mixture_gate is not None:
-        scalar_params.extend(list(base_model.mixture_gate.parameters()))
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -2068,7 +2045,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if args.mixture_head_enabled:
         log0(
-            f"mixture_head:on buckets={args.mixture_artifact_buckets} "
+            f"mixture_head:eval_only forward_logits buckets={args.mixture_artifact_buckets} "
             f"artifact_train_tokens={args.mixture_artifact_max_tokens} gate_h={args.mixture_gate_hidden}"
         )
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -2195,7 +2172,7 @@ def main() -> None:
         # EMA update
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
-                if name == "artifact_log_probs":
+                if name == "artifact_log_probs" or name.startswith("mixture_gate."):
                     continue
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
@@ -2207,7 +2184,7 @@ def main() -> None:
                 log0(f"swa:start step:{step}")
             else:
                 for name, t in base_model.state_dict().items():
-                    if name == "artifact_log_probs":
+                    if name == "artifact_log_probs" or name.startswith("mixture_gate."):
                         continue
                     swa_state[name] += t.detach().cpu()
                 swa_count += 1
