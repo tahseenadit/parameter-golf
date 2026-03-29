@@ -121,6 +121,8 @@ class Hyperparameters:
     mixture_train_subsample = float(os.environ.get("MIXTURE_TRAIN_SUBSAMPLE", "0.125"))
     mixture_train_topk = int(os.environ.get("MIXTURE_TRAIN_TOPK", "32"))
     mixture_train_loss_weight = float(os.environ.get("MIXTURE_TRAIN_LOSS_WEIGHT", "1.0"))
+    mixture_bigram_hash_buckets = int(os.environ.get("MIXTURE_BIGRAM_HASH_BUCKETS", "8192"))
+    mixture_prev_hash_buckets = int(os.environ.get("MIXTURE_PREV_HASH_BUCKETS", "2048"))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -877,6 +879,8 @@ class GPT(nn.Module):
         mixture_train_topk: int = 32,
         mixture_train_subsample: float = 1.0,
         mixture_train_loss_weight: float = 1.0,
+        mixture_bigram_hash_buckets: int = 8192,
+        mixture_prev_hash_buckets: int = 2048,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -957,6 +961,8 @@ class GPT(nn.Module):
         self.mixture_train_topk = mixture_train_topk
         self.mixture_train_subsample = mixture_train_subsample
         self.mixture_train_loss_weight = mixture_train_loss_weight
+        self.mixture_bigram_H = max(int(mixture_bigram_hash_buckets), 256)
+        self.mixture_prev_Hp = max(int(mixture_prev_hash_buckets), 64)
         if mixture_head_enabled:
             gate_in = model_dim + 6
             self.mixture_gate = nn.Sequential(
@@ -1066,26 +1072,13 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def _prefix_unibi_log_probs(self, x: Tensor) -> Tensor:
-        """Causal unigram + bigram mixture log-probs over `x` (teacher-forcing inputs)."""
-        B, T = x.shape
-        v = self.vocab_size_int
-        uni = x.new_zeros(B, v, dtype=torch.float32)
-        bi = x.new_zeros(B, v, v, dtype=torch.float32)
-        eps = 1e-3
-        outs: list[Tensor] = []
-        b_idx = torch.arange(B, device=x.device)
-        ones = torch.ones(B, device=x.device, dtype=torch.float32)
-        for i in range(T):
-            uni.scatter_add_(1, x[:, i : i + 1], ones.unsqueeze(1))
-            if i > 0:
-                bi[b_idx, x[:, i - 1], x[:, i]] += 1.0
-            u = (uni + eps) / (uni.sum(1, keepdim=True) + eps * v)
-            row = bi[b_idx, x[:, i]]
-            b_p = (row + eps) / (row.sum(1, keepdim=True) + eps * v)
-            p = 0.5 * u + 0.5 * b_p
-            outs.append(torch.log(p.clamp_min(1e-30)))
-        return torch.stack(outs, dim=1)
+    @staticmethod
+    def _mixture_pair_bucket(prev: Tensor, nxt: Tensor, h: int) -> Tensor:
+        return ((prev.long() * 1_000_003 + nxt.long() + 1) % h).to(torch.int64)
+
+    @staticmethod
+    def _mixture_prev_bucket(prev: Tensor, hp: int) -> Tensor:
+        return ((prev.long() * 1_000_003 + 1) % hp).to(torch.int64)
 
     def _artifact_bucket_ids(self, input_ids: Tensor) -> Tensor:
         B, T = input_ids.shape
@@ -1100,43 +1093,116 @@ class GPT(nn.Module):
             out[:, t] = h % self.mixture_artifact_buckets
         return out
 
-    def _mixture_alphas(self, x: Tensor, logits_tr: Tensor, input_ids: Tensor, log_p_cache: Tensor) -> Tensor:
-        lf = logits_tr.float()
-        p_tr = F.softmax(lf, dim=-1)
-        ent = -(p_tr * (p_tr.clamp_min(1e-12).log())).sum(-1, keepdim=True)
-        top2 = lf.topk(2, dim=-1).values
-        margin = top2[..., :1] - top2[..., 1:2]
-        B, T, _ = x.shape
-        device = x.device
+    def score_targets_mixed_nll(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        *,
+        cache_alpha: float = 1e-3,
+    ) -> Tensor:
+        """Per-token NLL (B, T): exact p_tr(y), target-only cache/artifact probs, gate — no full-vocab mixture."""
+        x = self._forward_hidden(input_ids)
+        logits_tr = self._lm_logits_from_hidden(x).float()
+        B, T, V = logits_tr.shape
+        device = logits_tr.device
+        lse = torch.logsumexp(logits_tr, dim=-1)
+        tgt_logit = logits_tr.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        log_p_tr_tgt = tgt_logit - lse
+        p_tr_tgt = torch.exp(log_p_tr_tgt).clamp_min(1e-30)
+        if not self.mixture_head_enabled or self.mixture_gate is None:
+            return -log_p_tr_tgt
+        top2 = logits_tr.topk(2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]
+        H = self.mixture_bigram_H
+        Hp = self.mixture_prev_Hp
+        uni = torch.zeros(B, V, device=device, dtype=torch.float32)
+        pair_cnt = torch.zeros(B, H, device=device, dtype=torch.float32)
+        prev_tot = torch.zeros(B, Hp, device=device, dtype=torch.float32)
+        b_idx = torch.arange(B, device=device)
+        ones = torch.ones(B, device=device, dtype=torch.float32)
+        p_cache_tgt = torch.empty(B, T, device=device, dtype=torch.float32)
+        cache_max = torch.empty(B, T, device=device, dtype=torch.float32)
+        eps = float(cache_alpha)
+        for i in range(T):
+            uni.scatter_add_(1, input_ids[:, i : i + 1], ones.unsqueeze(1))
+            if i > 0:
+                p_tok, n_tok = input_ids[:, i - 1], input_ids[:, i]
+                hb = self._mixture_pair_bucket(p_tok, n_tok, H)
+                hp_b = self._mixture_prev_bucket(p_tok, Hp)
+                pair_cnt.scatter_add_(1, hb.unsqueeze(1), ones.unsqueeze(1))
+                prev_tot.scatter_add_(1, hp_b.unsqueeze(1), ones.unsqueeze(1))
+            u = (uni + eps) / (uni.sum(1, keepdim=True) + eps * V)
+            prev = input_ids[:, i]
+            t = target_ids[:, i]
+            u_tgt = u.gather(1, t.unsqueeze(1)).squeeze(1)
+            if i == 0:
+                p_cache_tgt[:, i] = u_tgt.clamp_min(1e-30)
+            else:
+                hb = self._mixture_pair_bucket(prev, t, H)
+                hp = self._mixture_prev_bucket(prev, Hp)
+                num = pair_cnt.gather(1, hb.unsqueeze(1)).squeeze(1)
+                den = prev_tot.gather(1, hp.unsqueeze(1)).squeeze(1) + eps * float(H)
+                p_bi = (num + eps) / den.clamp_min(eps)
+                p_cache_tgt[:, i] = (0.5 * u_tgt + 0.5 * p_bi).clamp_min(1e-30)
+            cache_max[:, i] = u.max(dim=-1).values.clamp_min(1e-30)
+        bucket = self._artifact_bucket_ids(input_ids)
+        log_p_art = self.artifact_log_probs[bucket]
+        log_p_art_tgt = log_p_art.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        p_art_tgt = torch.exp(log_p_art_tgt.float()).clamp_min(1e-30)
         prev = input_ids
-        ws = self.tok_is_ws[prev].to(dtype=lf.dtype)
-        bd = self.tok_is_boundary[prev].to(dtype=lf.dtype)
-        rep = torch.zeros(B, T, 1, device=device, dtype=lf.dtype)
+        ws = self.tok_is_ws[prev].to(dtype=torch.float32)
+        bd = self.tok_is_boundary[prev].to(dtype=torch.float32)
+        rep = torch.zeros(B, T, device=device, dtype=torch.float32)
         if T > 1:
-            rep[:, 1:, 0] = (input_ids[:, 1:] == input_ids[:, :-1]).to(lf.dtype)
-        p_ca = torch.exp(log_p_cache.float())
-        cmax = p_ca.max(-1, keepdim=True).values
+            rep[:, 1:] = (input_ids[:, 1:] == input_ids[:, :-1]).to(torch.float32)
         feat = torch.cat(
             [
                 x.float(),
-                ent.clamp_min(1e-12).log(),
-                margin,
+                log_p_tr_tgt.unsqueeze(-1),
+                margin.unsqueeze(-1),
                 ws.unsqueeze(-1),
                 bd.unsqueeze(-1),
-                rep,
-                cmax.clamp_min(1e-12).log(),
+                rep.unsqueeze(-1),
+                cache_max.log().unsqueeze(-1),
             ],
             dim=-1,
         )
-        return F.softmax(self.mixture_gate(feat), dim=-1)
+        alphas = F.softmax(self.mixture_gate(feat), dim=-1)
+        p_mix_tgt = (
+            alphas[..., 0] * p_tr_tgt
+            + alphas[..., 1] * p_cache_tgt
+            + alphas[..., 2] * p_art_tgt
+        ).clamp_min(1e-30)
+        return -torch.log(p_mix_tgt)
+
+    def _hashed_cache_probs_on_cand(
+        self,
+        u_row: Tensor,
+        pair_row: Tensor,
+        prev_row: Tensor,
+        prev_id: Tensor,
+        cand: Tensor,
+        eps: float,
+    ) -> Tensor:
+        """Per-candidate 0.5*u[w]+0.5*p_bi_hat for one batch row; u_row (V,), pair_row (H,), prev_row (Hp,)."""
+        H = self.mixture_bigram_H
+        u_w = u_row[cand]
+        hb = self._mixture_pair_bucket(prev_id.expand_as(cand), cand, H)
+        hp = self._mixture_prev_bucket(prev_id.expand_as(cand), self.mixture_prev_Hp)
+        num = pair_row[hb]
+        den = prev_row[hp] + eps * float(H)
+        p_bi = (num + eps) / den.clamp_min(eps)
+        return 0.5 * u_w + 0.5 * p_bi
 
     def _sparse_mixture_aux_loss(
         self, x: Tensor, logits_tr: Tensor, input_ids: Tensor, target_ids: Tensor
     ) -> Tensor:
-        """Candidate-set mixture NLL (~O(B*T*K)); transformer/cache probs for mixing are detached so grads focus on the gate."""
+        """Candidate-set mixture NLL; hashed bigram buckets (no V×V table)."""
         B, T, _ = x.shape
         V = self.vocab_size_int
         K = min(self.mixture_train_topk, V)
+        H = self.mixture_bigram_H
+        Hp = self.mixture_prev_Hp
         dev = input_ids.device
         subs = self.mixture_train_subsample
         if subs <= 0.0:
@@ -1148,15 +1214,19 @@ class GPT(nn.Module):
         if not mask.any():
             return logits_tr.sum() * 0.0
         uni = torch.zeros(B, V, device=dev, dtype=torch.float32)
-        bi = torch.zeros(B, V, V, device=dev, dtype=torch.float32)
-        b_idx = torch.arange(B, device=dev)
+        pair_cnt = torch.zeros(B, H, device=dev, dtype=torch.float32)
+        prev_tot = torch.zeros(B, Hp, device=dev, dtype=torch.float32)
         ones = torch.ones(B, device=dev, dtype=torch.float32)
         eps = 1e-3
         loss_terms: list[Tensor] = []
         for i in range(T):
             uni.scatter_add_(1, input_ids[:, i : i + 1], ones.unsqueeze(1))
             if i > 0:
-                bi[b_idx, input_ids[:, i - 1], input_ids[:, i]] += 1.0
+                p_tok, n_tok = input_ids[:, i - 1], input_ids[:, i]
+                hb = self._mixture_pair_bucket(p_tok, n_tok, H)
+                hp_b = self._mixture_prev_bucket(p_tok, Hp)
+                pair_cnt.scatter_add_(1, hb.unsqueeze(1), ones.unsqueeze(1))
+                prev_tot.scatter_add_(1, hp_b.unsqueeze(1), ones.unsqueeze(1))
             mb = mask[:, i]
             if not mb.any():
                 continue
@@ -1166,22 +1236,23 @@ class GPT(nn.Module):
             lf_full = logits_tr[bs, i].float()
             _, topix_tr = lf_full.topk(K, dim=-1)
             u = (uni[bs] + eps) / (uni[bs].sum(1, keepdim=True) + eps * V)
-            row = bi[bs, input_ids[bs, i]]
-            b_p = (row + eps) / (row.sum(1, keepdim=True) + eps * V)
-            p_cache = 0.5 * u + 0.5 * b_p
-            _, topix_ca = p_cache.topk(K, dim=-1)
+            _, topix_ca = u.topk(K, dim=-1)
             ctx = input_ids[bs, max(0, i - 6) : i + 1]
-            h = torch.zeros(bs.numel(), dtype=torch.int64, device=dev)
+            hctx = torch.zeros(bs.numel(), dtype=torch.int64, device=dev)
             for j in range(ctx.size(1)):
-                h = (h * 1_000_003 + ctx[:, j] + 1) & 0xFFFFFFFFFFFFFFFF
-            bucket = h % self.mixture_artifact_buckets
+                hctx = (hctx * 1_000_003 + ctx[:, j] + 1) & 0xFFFFFFFFFFFFFFFF
+            bucket = hctx % self.mixture_artifact_buckets
             log_p_art_row = self.artifact_log_probs[bucket]
             _, topix_ar = log_p_art_row.topk(K, dim=-1)
             tgt = target_ids[bs, i]
+            prev_vec = input_ids[bs, i]
+            pc_rows = pair_cnt[bs]
+            pt_rows = prev_tot[bs]
             nb = int(bs.numel())
             for r in range(nb):
                 b = int(bs[r].item())
                 tt = int(tgt[r].item())
+                prev_id = prev_vec[r]
                 cand = torch.cat(
                     [
                         topix_tr[r],
@@ -1193,31 +1264,34 @@ class GPT(nn.Module):
                 cand = torch.unique(cand)
                 lf_c = lf_full[r, cand]
                 lf_det = lf_c.detach()
-                pc = p_cache[r, cand]
+                lf_row = lf_full[r]
+                lse_row = torch.logsumexp(lf_row, dim=-1)
+                log_p_tr_tt = (lf_row[tt] - lse_row).reshape(1)
+                if V >= 2:
+                    t2f = lf_row.topk(2).values
+                    margin = (t2f[0] - t2f[1]).reshape(1)
+                else:
+                    margin = lf_row[:1] * 0.0
+                pc = self._hashed_cache_probs_on_cand(
+                    u[r], pc_rows[r], pt_rows[r], prev_id, cand, eps
+                )
                 pc = pc / pc.sum().clamp_min(1e-12)
                 pa = torch.exp(log_p_art_row[r, cand].float())
                 pa = pa / pa.sum().clamp_min(1e-12)
                 p_tr = F.softmax(lf_det, dim=-1)
-                p_ent = F.softmax(lf_det, dim=-1)
-                ent = -(p_ent * (p_ent.clamp_min(1e-12).log())).sum().reshape(1)
-                if cand.numel() >= 2:
-                    t2 = lf_det.topk(2).values
-                    margin = (t2[0] - t2[1]).reshape(1)
-                else:
-                    margin = lf_det[:1] * 0.0
-                prev = input_ids[b, i]
-                ws = self.tok_is_ws[prev].reshape(1)
-                bd = self.tok_is_boundary[prev].reshape(1)
+                prev_t = input_ids[b, i]
+                ws = self.tok_is_ws[prev_t].reshape(1)
+                bd = self.tok_is_boundary[prev_t].reshape(1)
                 rep = torch.tensor(
                     [1.0 if i > 0 and input_ids[b, i] == input_ids[b, i - 1] else 0.0],
                     device=dev,
                     dtype=torch.float32,
                 ).reshape(1)
-                cmax = p_cache[r, cand].max().reshape(1)
+                cmax = u[r].max().reshape(1)
                 feat = torch.cat(
                     [
                         x[b, i].float().detach(),
-                        ent.clamp_min(1e-12).log(),
+                        log_p_tr_tt,
                         margin,
                         ws,
                         bd,
@@ -1270,22 +1344,9 @@ class GPT(nn.Module):
         return main_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        """Return logits (bsz, seq_len, vocab) — after optional mixture of transformer,cache,artifact."""
+        """Transformer logits (B, T, V) only. Use `score_targets_mixed_nll` for eval mixture scoring."""
         x = self._forward_hidden(input_ids)
-        logits_tr = self._lm_logits_from_hidden(x)
-        if not self.mixture_head_enabled:
-            return logits_tr
-        log_p_cache = self._prefix_unibi_log_probs(input_ids)
-        bucket = self._artifact_bucket_ids(input_ids)
-        log_p_art = self.artifact_log_probs[bucket]
-        alphas = self._mixture_alphas(x, logits_tr, input_ids, log_p_cache)
-        p_tr = F.softmax(logits_tr.float(), dim=-1)
-        p_ca = torch.exp(log_p_cache.float())
-        p_ar = torch.exp(log_p_art.float())
-        p_mix = (
-            alphas[..., 0:1] * p_tr + alphas[..., 1:2] * p_ca + alphas[..., 2:3] * p_ar
-        ).clamp_min(1e-30)
-        return torch.log(p_mix)
+        return self._lm_logits_from_hidden(x)
 
 # --- Sliding window evaluation ---
 
@@ -1316,10 +1377,9 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    if getattr(base_model, "mixture_head_enabled", False):
-        logits_fn = base_model.forward_logits
-    else:
-        logits_fn = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = None
+    if not getattr(base_model, "mixture_head_enabled", False):
+        compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1335,14 +1395,15 @@ def eval_val_sliding(
                 x_batch[i, :wlen] = chunk[:-1]
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = logits_fn(x_batch)
-            logp = logits.reshape(-1, logits.size(-1)).float()
-            y_flat = y_batch.reshape(-1)
-            if getattr(base_model, "mixture_head_enabled", False):
-                nll = F.nll_loss(logp, y_flat, reduction="none")
-            else:
-                nll = F.cross_entropy(logp, y_flat, reduction="none")
-            nll = nll.reshape(bsz, seq_len)
+                if getattr(base_model, "mixture_head_enabled", False):
+                    nll = base_model.score_targets_mixed_nll(x_batch, y_batch)
+                else:
+                    logits = compiled_logits(x_batch)
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        y_batch.reshape(-1),
+                        reduction="none",
+                    ).reshape(bsz, seq_len)
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -1450,14 +1511,15 @@ def eval_val_sliding_ttt(
                     x_batch[i, :wlen] = chunk_tok[:-1]
                     y_batch[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = base_model.forward_logits(x_batch)
-                logp = logits.reshape(-1, logits.size(-1)).float()
-                y_flat = y_batch.reshape(-1)
-                if getattr(base_model, "mixture_head_enabled", False):
-                    nll = F.nll_loss(logp, y_flat, reduction="none")
-                else:
-                    nll = F.cross_entropy(logp, y_flat, reduction="none")
-                nll = nll.reshape(bsz, seq_len)
+                    if getattr(base_model, "mixture_head_enabled", False):
+                        nll = base_model.score_targets_mixed_nll(x_batch, y_batch)
+                    else:
+                        logits = base_model.forward_logits(x_batch)
+                        nll = F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)).float(),
+                            y_batch.reshape(-1),
+                            reduction="none",
+                        ).reshape(bsz, seq_len)
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -2043,6 +2105,8 @@ def main() -> None:
         mixture_train_topk=args.mixture_train_topk,
         mixture_train_subsample=args.mixture_train_subsample,
         mixture_train_loss_weight=args.mixture_train_loss_weight,
+        mixture_bigram_hash_buckets=args.mixture_bigram_hash_buckets,
+        mixture_prev_hash_buckets=args.mixture_prev_hash_buckets,
     ).to(device).bfloat16()
     if args.mixture_head_enabled:
         vn = args.vocab_size
@@ -2177,12 +2241,15 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if args.mixture_head_enabled:
         log0(
-            f"mixture_head:forward_logits buckets={args.mixture_artifact_buckets} "
+            f"mixture_head:sliding=score_targets_mixed_nll buckets={args.mixture_artifact_buckets} "
             f"artifact_train_tokens={args.mixture_artifact_max_tokens} gate_h={args.mixture_gate_hidden}"
         )
         log0(
             f"mixture_train:start_frac={args.mixture_train_start_frac} subsample={args.mixture_train_subsample} "
             f"topk={args.mixture_train_topk} loss_w={args.mixture_train_loss_weight}"
+        )
+        log0(
+            f"mixture_cache:bigram_hash_H={args.mixture_bigram_hash_buckets} prev_hash_Hp={args.mixture_prev_hash_buckets}"
         )
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
@@ -2482,6 +2549,8 @@ def main() -> None:
         mixture_train_topk=args.mixture_train_topk,
         mixture_train_subsample=args.mixture_train_subsample,
         mixture_train_loss_weight=args.mixture_train_loss_weight,
+        mixture_bigram_hash_buckets=args.mixture_bigram_hash_buckets,
+        mixture_prev_hash_buckets=args.mixture_prev_hash_buckets,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
