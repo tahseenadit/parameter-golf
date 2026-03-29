@@ -116,6 +116,11 @@ class Hyperparameters:
     mixture_gate_hidden = int(os.environ.get("MIXTURE_GATE_HIDDEN", "64"))
     mixture_artifact_buckets = int(os.environ.get("MIXTURE_ARTIFACT_BUCKETS", "1024"))
     mixture_artifact_max_tokens = int(os.environ.get("MIXTURE_ARTIFACT_MAX_TOKENS", str(5_000_000)))
+    # Late sparse mixture training: start_frac 1.0 = disabled (eval-only gate). Lower = earlier gate updates.
+    mixture_train_start_frac = float(os.environ.get("MIXTURE_TRAIN_START_FRAC", "1.0"))
+    mixture_train_subsample = float(os.environ.get("MIXTURE_TRAIN_SUBSAMPLE", "0.125"))
+    mixture_train_topk = int(os.environ.get("MIXTURE_TRAIN_TOPK", "32"))
+    mixture_train_loss_weight = float(os.environ.get("MIXTURE_TRAIN_LOSS_WEIGHT", "1.0"))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -868,6 +873,10 @@ class GPT(nn.Module):
         mixture_head_enabled: bool = False,
         mixture_gate_hidden: int = 64,
         mixture_artifact_buckets: int = 1024,
+        mixture_train_start_frac: float = 1.0,
+        mixture_train_topk: int = 32,
+        mixture_train_subsample: float = 1.0,
+        mixture_train_loss_weight: float = 1.0,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -944,6 +953,10 @@ class GPT(nn.Module):
         self.mixture_head_enabled = mixture_head_enabled
         self.mixture_artifact_buckets = mixture_artifact_buckets
         self.vocab_size_int = vocab_size
+        self.mixture_train_start_frac = mixture_train_start_frac
+        self.mixture_train_topk = mixture_train_topk
+        self.mixture_train_subsample = mixture_train_subsample
+        self.mixture_train_loss_weight = mixture_train_loss_weight
         if mixture_head_enabled:
             gate_in = model_dim + 6
             self.mixture_gate = nn.Sequential(
@@ -954,8 +967,9 @@ class GPT(nn.Module):
             self.register_buffer("artifact_log_probs", torch.zeros(mixture_artifact_buckets, vocab_size))
             self.register_buffer("tok_is_ws", torch.zeros(vocab_size, dtype=torch.float32))
             self.register_buffer("tok_is_boundary", torch.zeros(vocab_size, dtype=torch.float32))
+            _train_gate = mixture_train_start_frac < 1.0
             for p in self.mixture_gate.parameters():
-                p.requires_grad_(False)
+                p.requires_grad_(_train_gate)
         else:
             self.mixture_gate = None
         self._init_weights()
@@ -1116,13 +1130,125 @@ class GPT(nn.Module):
         )
         return F.softmax(self.mixture_gate(feat), dim=-1)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Training loss: transformer CE only. Mixture (cache + artifact + gate) is eval-only in `forward_logits`."""
+    def _sparse_mixture_aux_loss(
+        self, x: Tensor, logits_tr: Tensor, input_ids: Tensor, target_ids: Tensor
+    ) -> Tensor:
+        """Candidate-set mixture NLL (~O(B*T*K)); transformer/cache probs for mixing are detached so grads focus on the gate."""
+        B, T, _ = x.shape
+        V = self.vocab_size_int
+        K = min(self.mixture_train_topk, V)
+        dev = input_ids.device
+        subs = self.mixture_train_subsample
+        if subs <= 0.0:
+            return logits_tr.sum() * 0.0
+        if subs >= 1.0:
+            mask = torch.ones(B, T, dtype=torch.bool, device=dev)
+        else:
+            mask = torch.rand(B, T, device=dev) < subs
+        if not mask.any():
+            return logits_tr.sum() * 0.0
+        uni = torch.zeros(B, V, device=dev, dtype=torch.float32)
+        bi = torch.zeros(B, V, V, device=dev, dtype=torch.float32)
+        b_idx = torch.arange(B, device=dev)
+        ones = torch.ones(B, device=dev, dtype=torch.float32)
+        eps = 1e-3
+        loss_terms: list[Tensor] = []
+        for i in range(T):
+            uni.scatter_add_(1, input_ids[:, i : i + 1], ones.unsqueeze(1))
+            if i > 0:
+                bi[b_idx, input_ids[:, i - 1], input_ids[:, i]] += 1.0
+            mb = mask[:, i]
+            if not mb.any():
+                continue
+            bs = mb.nonzero(as_tuple=False).squeeze(-1)
+            if bs.ndim == 0:
+                bs = bs.unsqueeze(0)
+            lf_full = logits_tr[bs, i].float()
+            _, topix_tr = lf_full.topk(K, dim=-1)
+            u = (uni[bs] + eps) / (uni[bs].sum(1, keepdim=True) + eps * V)
+            row = bi[bs, input_ids[bs, i]]
+            b_p = (row + eps) / (row.sum(1, keepdim=True) + eps * V)
+            p_cache = 0.5 * u + 0.5 * b_p
+            _, topix_ca = p_cache.topk(K, dim=-1)
+            ctx = input_ids[bs, max(0, i - 6) : i + 1]
+            h = torch.zeros(bs.numel(), dtype=torch.int64, device=dev)
+            for j in range(ctx.size(1)):
+                h = (h * 1_000_003 + ctx[:, j] + 1) & 0xFFFFFFFFFFFFFFFF
+            bucket = h % self.mixture_artifact_buckets
+            log_p_art_row = self.artifact_log_probs[bucket]
+            _, topix_ar = log_p_art_row.topk(K, dim=-1)
+            tgt = target_ids[bs, i]
+            nb = int(bs.numel())
+            for r in range(nb):
+                b = int(bs[r].item())
+                tt = int(tgt[r].item())
+                cand = torch.cat(
+                    [
+                        topix_tr[r],
+                        topix_ca[r],
+                        topix_ar[r],
+                        torch.tensor([tt], device=dev, dtype=torch.int64),
+                    ]
+                )
+                cand = torch.unique(cand)
+                lf_c = lf_full[r, cand]
+                lf_det = lf_c.detach()
+                pc = p_cache[r, cand]
+                pc = pc / pc.sum().clamp_min(1e-12)
+                pa = torch.exp(log_p_art_row[r, cand].float())
+                pa = pa / pa.sum().clamp_min(1e-12)
+                p_tr = F.softmax(lf_det, dim=-1)
+                p_ent = F.softmax(lf_det, dim=-1)
+                ent = -(p_ent * (p_ent.clamp_min(1e-12).log())).sum().reshape(1)
+                if cand.numel() >= 2:
+                    t2 = lf_det.topk(2).values
+                    margin = (t2[0] - t2[1]).reshape(1)
+                else:
+                    margin = lf_det[:1] * 0.0
+                prev = input_ids[b, i]
+                ws = self.tok_is_ws[prev].reshape(1)
+                bd = self.tok_is_boundary[prev].reshape(1)
+                rep = torch.tensor(
+                    [1.0 if i > 0 and input_ids[b, i] == input_ids[b, i - 1] else 0.0],
+                    device=dev,
+                    dtype=torch.float32,
+                ).reshape(1)
+                cmax = p_cache[r, cand].max().reshape(1)
+                feat = torch.cat(
+                    [
+                        x[b, i].float().detach(),
+                        ent.clamp_min(1e-12).log(),
+                        margin,
+                        ws,
+                        bd,
+                        rep,
+                        cmax.clamp_min(1e-12).log(),
+                    ]
+                ).unsqueeze(0)
+                alphas = F.softmax(self.mixture_gate(feat), dim=-1).squeeze(0)
+                p_mix = alphas[0] * p_tr + alphas[1] * pc + alphas[2] * pa
+                hit = (cand == tt).nonzero(as_tuple=True)[0]
+                j = int(hit[0].item())
+                loss_terms.append(-torch.log(p_mix[j].clamp_min(1e-30)))
+        if not loss_terms:
+            return logits_tr.sum() * 0.0
+        return torch.stack(loss_terms).mean()
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor, sparse_mixture_train: bool = False) -> Tensor:
+        """Transformer CE; optional sparse mixture auxiliary when `sparse_mixture_train` (eager path, not compiled)."""
         x = self._forward_hidden(input_ids)
         logits_tr = self._lm_logits_from_hidden(x)
         logits = logits_tr.reshape(-1, logits_tr.size(-1))
         targets = target_ids.reshape(-1)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if (
+            sparse_mixture_train
+            and self.training
+            and self.mixture_head_enabled
+            and self.mixture_gate is not None
+        ):
+            aux = self._sparse_mixture_aux_loss(x, logits_tr, input_ids, target_ids)
+            main_loss = main_loss + self.mixture_train_loss_weight * aux
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
             mtp_loss_sum = x.new_zeros(())
@@ -1913,6 +2039,10 @@ def main() -> None:
         mixture_head_enabled=args.mixture_head_enabled,
         mixture_gate_hidden=args.mixture_gate_hidden,
         mixture_artifact_buckets=args.mixture_artifact_buckets,
+        mixture_train_start_frac=args.mixture_train_start_frac,
+        mixture_train_topk=args.mixture_train_topk,
+        mixture_train_subsample=args.mixture_train_subsample,
+        mixture_train_loss_weight=args.mixture_train_loss_weight,
     ).to(device).bfloat16()
     if args.mixture_head_enabled:
         vn = args.vocab_size
@@ -1981,6 +2111,8 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    if base_model.mixture_gate is not None and args.mixture_train_start_frac < 1.0:
+        scalar_params.extend(list(base_model.mixture_gate.parameters()))
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -2045,8 +2177,12 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     if args.mixture_head_enabled:
         log0(
-            f"mixture_head:eval_only forward_logits buckets={args.mixture_artifact_buckets} "
+            f"mixture_head:forward_logits buckets={args.mixture_artifact_buckets} "
             f"artifact_train_tokens={args.mixture_artifact_max_tokens} gate_h={args.mixture_gate_hidden}"
+        )
+        log0(
+            f"mixture_train:start_frac={args.mixture_train_start_frac} subsample={args.mixture_train_subsample} "
+            f"topk={args.mixture_train_topk} loss_w={args.mixture_train_loss_weight}"
         )
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
@@ -2100,6 +2236,15 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
+    mix_sparse_train = (
+        args.mixture_head_enabled
+        and args.mixture_train_start_frac < 1.0
+        and args.mixture_train_subsample > 0.0
+    )
+    mix_start_step = (
+        int(args.mixture_train_start_frac * args.iterations) if mix_sparse_train else args.iterations + 1
+    )
+    mix_sparse_logged = False
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
@@ -2138,10 +2283,17 @@ def main() -> None:
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        use_sparse_mix = mix_sparse_train and step >= mix_start_step
+        if use_sparse_mix and master_process and not mix_sparse_logged:
+            log0(f"mixture_sparse_train:start step>={mix_start_step} (start_frac={args.mixture_train_start_frac})")
+            mix_sparse_logged = True
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                if use_sparse_mix:
+                    loss = base_model(x, y, sparse_mixture_train=True)
+                else:
+                    loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -2172,7 +2324,9 @@ def main() -> None:
         # EMA update
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
-                if name == "artifact_log_probs" or name.startswith("mixture_gate."):
+                if name == "artifact_log_probs":
+                    continue
+                if name.startswith("mixture_gate.") and args.mixture_train_start_frac >= 1.0:
                     continue
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
@@ -2184,7 +2338,9 @@ def main() -> None:
                 log0(f"swa:start step:{step}")
             else:
                 for name, t in base_model.state_dict().items():
-                    if name == "artifact_log_probs" or name.startswith("mixture_gate."):
+                    if name == "artifact_log_probs":
+                        continue
+                    if name.startswith("mixture_gate.") and args.mixture_train_start_frac >= 1.0:
                         continue
                     swa_state[name] += t.detach().cpu()
                 swa_count += 1
@@ -2322,6 +2478,10 @@ def main() -> None:
         mixture_head_enabled=args.mixture_head_enabled,
         mixture_gate_hidden=args.mixture_gate_hidden,
         mixture_artifact_buckets=args.mixture_artifact_buckets,
+        mixture_train_start_frac=1.0,
+        mixture_train_topk=args.mixture_train_topk,
+        mixture_train_subsample=args.mixture_train_subsample,
+        mixture_train_loss_weight=args.mixture_train_loss_weight,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
