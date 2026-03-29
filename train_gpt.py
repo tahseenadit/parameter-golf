@@ -59,9 +59,10 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     # Export quantization (GPTQ-lite). Training: bank weights stay FP32 under Muon/Adam (full-prec params).
-    # Default scheme: int6 blockwise on attn projections, int4 on MLP, FP16 tok_emb, FP16 small tensors.
+    # Default scheme: attn int6 blockwise; MLP int4 except last GPTQ_LAST_N_MLP_INT6 blocks int6; tok_emb FP16; small tensors FP16.
     gptq_scheme = os.environ.get("GPTQ_SCHEME", "attn6_mlp4_emb_fp16").strip().lower()
-    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
+    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "128"))
+    gptq_last_n_mlp_int6 = int(os.environ.get("GPTQ_LAST_N_MLP_INT6", "4"))
     gptq_first_n_int4 = int(os.environ.get("GPTQ_FIRST_N_INT4", "0"))
     gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "999"))
     gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "0"))
@@ -739,7 +740,7 @@ class MLP(nn.Module):
         super().__init__()
         # No CastedLinear -- weights come from banks
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
+        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.75)
         return F.linear(x.square(), down_w.to(x.dtype))
 
 class Block(nn.Module):
@@ -1496,6 +1497,7 @@ def mixed_quantize_int6(
     first_n_int4: int = 0,
     int6_cats: set[str] | None = None,
     last_n_int6: int = 0,
+    last_n_mlp_int6: int = 0,
     int8_cats: set[str] | None = None,
     last_n_int8: int = 0,
     block_size: int = 64,
@@ -1505,6 +1507,11 @@ def mixed_quantize_int6(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
+    mlp_int6_layers = (
+        set(range(max(num_layers_total - max(last_n_mlp_int6, 0), 0), num_layers_total))
+        if last_n_mlp_int6 > 0
+        else set()
+    )
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     if int6_cats is None:
@@ -1539,10 +1546,16 @@ def mixed_quantize_int6(
                 meta[name] = "passthrough_fp16"
                 continue
             if cat == "mlp" and t.ndim >= 1:
-                q, s = quantize_int4_blockwise_per_row(t, block_size)
+                li_m = _layer_index_from_name(name)
+                if li_m is not None and li_m in mlp_int6_layers:
+                    q, s = quantize_int6_blockwise_per_row(t, block_size)
+                    meta_ty = "int6_block"
+                else:
+                    q, s = quantize_int4_blockwise_per_row(t, block_size)
+                    meta_ty = "int4_block"
                 result[name + ".q"] = q
                 result[name + ".scale"] = s
-                meta[name] = {"type": "int4_block", "block_size": block_size if t.ndim in (1, 2) else 0}
+                meta[name] = {"type": meta_ty, "block_size": block_size if t.ndim in (1, 2) else 0}
                 continue
             if cat == "attn" and t.ndim >= 1:
                 q, s = quantize_int6_blockwise_per_row(t, block_size)
@@ -2057,6 +2070,7 @@ def main() -> None:
         first_n_int4=args.gptq_first_n_int4,
         int6_cats=args.gptq_int6_cats,
         last_n_int6=args.gptq_last_n_int6,
+        last_n_mlp_int6=args.gptq_last_n_mlp_int6,
         int8_cats=args.gptq_int8_cats,
         last_n_int8=args.gptq_last_n_int8,
         block_size=args.gptq_block_size,
@@ -2068,6 +2082,7 @@ def main() -> None:
             f" scheme={args.gptq_scheme}"
             f" compressor={_COMPRESSOR}"
             f" block_size={args.gptq_block_size}"
+            f" mlp_int6_last_n={args.gptq_last_n_mlp_int6}"
             f" int4_first_n={args.gptq_first_n_int4} int4_cats={sorted(args.gptq_int4_cats)}"
             f" int6_last_n={args.gptq_last_n_int6} int6_cats={sorted(args.gptq_int6_cats)}"
             f" int8_last_n={args.gptq_last_n_int8} int8_cats={sorted(args.gptq_int8_cats)}"
