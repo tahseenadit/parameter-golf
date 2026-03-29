@@ -58,14 +58,14 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
-    # Export quantization (GPTQ-lite) defaults:
-    # - first GPTQ_FIRST_N_INT4 blocks: attn+mlp int4 blockwise; remaining blocks int6
-    # - GPTQ_LAST_N_INT6=999 ⇒ all later layers use int6; int4 takes precedence on early layers
-    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "16"))
-    gptq_first_n_int4 = int(os.environ.get("GPTQ_FIRST_N_INT4", "2"))
+    # Export quantization (GPTQ-lite). Training: bank weights stay FP32 under Muon/Adam (full-prec params).
+    # Default scheme: int6 blockwise on attn projections, int4 on MLP, FP16 tok_emb, FP16 small tensors.
+    gptq_scheme = os.environ.get("GPTQ_SCHEME", "attn6_mlp4_emb_fp16").strip().lower()
+    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", "64"))
+    gptq_first_n_int4 = int(os.environ.get("GPTQ_FIRST_N_INT4", "0"))
     gptq_last_n_int6 = int(os.environ.get("GPTQ_LAST_N_INT6", "999"))
     gptq_last_n_int8 = int(os.environ.get("GPTQ_LAST_N_INT8", "0"))
-    gptq_int4_cats = set([s for s in os.environ.get("GPTQ_INT4_CATS", "mlp,attn").split(",") if s])
+    gptq_int4_cats = set([s for s in os.environ.get("GPTQ_INT4_CATS", "").split(",") if s])
     gptq_int6_cats = set([s for s in os.environ.get("GPTQ_INT6_CATS", "mlp,attn").split(",") if s])
     gptq_int8_cats = set([s for s in os.environ.get("GPTQ_INT8_CATS", "mlp,attn").split(",") if s])
     gptq_skip_name_patterns = tuple(
@@ -1492,6 +1492,7 @@ def mixed_quantize_int6(
     state_dict: dict[str, Tensor],
     int4_cats: set[str],
     *,
+    scheme: str = "legacy",
     first_n_int4: int = 0,
     int6_cats: set[str] | None = None,
     last_n_int6: int = 0,
@@ -1514,6 +1515,7 @@ def mixed_quantize_int6(
     int8_layers = set(range(max(num_layers_total - max(last_n_int8, 0), 0), num_layers_total)) if last_n_int8 > 0 else set()
     n_early = min(max(first_n_int4, 0), num_layers_total)
     int4_layers = set(range(n_early)) if n_early > 0 and int4_cats else set()
+    use_attn6_mlp4 = scheme in ("attn6_mlp4_emb_fp16", "attn6_mlp4")
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
@@ -1531,6 +1533,29 @@ def mixed_quantize_int6(
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
+        if use_attn6_mlp4:
+            if "tok_emb" in name:
+                result[name] = t.to(torch.float16)
+                meta[name] = "passthrough_fp16"
+                continue
+            if cat == "mlp" and t.ndim >= 1:
+                q, s = quantize_int4_blockwise_per_row(t, block_size)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int4_block", "block_size": block_size if t.ndim in (1, 2) else 0}
+                continue
+            if cat == "attn" and t.ndim >= 1:
+                q, s = quantize_int6_blockwise_per_row(t, block_size)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int6_block", "block_size": block_size if t.ndim in (1, 2) else 0}
+                continue
+            q, s = quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
+            continue
+        # legacy: layer-masked int8 / int4 / int6 via env (GPTQ_SCHEME=legacy)
         li = _layer_index_from_name(name)
         use_int8 = (li is not None and li in int8_layers and cat in int8_cats and t.ndim >= 1)
         use_int4 = (li is not None and li in int4_layers and cat in int4_cats and t.ndim >= 1)
@@ -1770,6 +1795,7 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
+    # Matrix banks: FP32 parameter storage; Muon applies updates in FP32 (grad NS path uses BF16 internally).
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
@@ -2027,6 +2053,7 @@ def main() -> None:
     quant_result, quant_meta = mixed_quantize_int6(
         unbanked_sd,
         args.gptq_int4_cats,
+        scheme=args.gptq_scheme,
         first_n_int4=args.gptq_first_n_int4,
         int6_cats=args.gptq_int6_cats,
         last_n_int6=args.gptq_last_n_int6,
@@ -2038,6 +2065,7 @@ def main() -> None:
     if master_process:
         log0(
             "export_quant:"
+            f" scheme={args.gptq_scheme}"
             f" compressor={_COMPRESSOR}"
             f" block_size={args.gptq_block_size}"
             f" int4_first_n={args.gptq_first_n_int4} int4_cats={sorted(args.gptq_int4_cats)}"
