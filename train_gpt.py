@@ -2020,6 +2020,14 @@ def main() -> None:
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    n_cuda = torch.cuda.device_count()
+    if local_rank < 0 or local_rank >= n_cuda:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is invalid: only {n_cuda} CUDA device(s) are visible to this process. "
+            f"Match torchrun --nproc_per_node (and per-node GPU count) to visible devices "
+            f"(check CUDA_VISIBLE_DEVICES / NVIDIA_VISIBLE_DEVICES). "
+            f"rank={rank} WORLD_SIZE={world_size}."
+        )
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
