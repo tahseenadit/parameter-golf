@@ -125,12 +125,47 @@ class Hyperparameters:
     mixture_train_loss_weight = float(os.environ.get("MIXTURE_TRAIN_LOSS_WEIGHT", "1.0"))
     mixture_bigram_hash_buckets = int(os.environ.get("MIXTURE_BIGRAM_HASH_BUCKETS", "8192"))
     mixture_prev_hash_buckets = int(os.environ.get("MIXTURE_PREV_HASH_BUCKETS", "2048"))
+    # polar_express: Amsel et al. (Polar Express) minimax degree-5 coeffs per iteration; jordan = fixed (3.4445,−4.775,2.0315)×steps.
+    muon_ns_backend = os.environ.get("MUON_NS_BACKEND", "polar_express").strip().lower()
+    # Warmdown: floor LR multiplier at this fraction of base_lr (e.g. 0.10 = 10% of peak LR).
+    min_lr = float(os.environ.get("MIN_LR", "0.10"))
+    # LQER: low-rank int4(asymmetric) correction on top-K worst int4_block GPTQ residuals (export only).
+    lqer_enabled = bool(int(os.environ.get("LQER_ENABLED", "0")))
+    lqer_rank = int(os.environ.get("LQER_RANK", "4"))
+    lqer_top_k = int(os.environ.get("LQER_TOP_K", "3"))
 
-# --- Batched Newton-Schulz orthogonalization ---
+# --- Batched Newton-Schulz orthogonalization (Polar Express vs Jordan / modded-nanogpt) ---
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
-    """Batched Newton-Schulz orthogonalization. G: (B,M,N) or (M,N)."""
-    a, b, c = (3.4445, -4.7750, 2.0315)
+# Coefficients from Amsel et al., Algorithm 1 (arxiv:2505.16932v2); safety scaling on all but the tail polynomial.
+_NS_SF = 1.01
+_POLAR_EXPRESS_UNSCALED: tuple[tuple[float, float, float], ...] = (
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+    (1.875, -1.25, 0.375),
+)
+_POLAR_EXPRESS_COEFFS: tuple[tuple[float, float, float], ...] = tuple(
+    (a / _NS_SF, b / (_NS_SF ** 3), c / (_NS_SF ** 5)) for a, b, c in _POLAR_EXPRESS_UNSCALED[:-1]
+) + (_POLAR_EXPRESS_UNSCALED[-1],)
+
+
+def zeropower_via_newtonschulz5(
+    G: Tensor,
+    steps: int = 5,
+    eps: float = 1e-7,
+    *,
+    ns_backend: str = "polar_express",
+) -> Tensor:
+    """Batched Newton-Schulz–style orthogonalization. G: (B,M,N) or (M,N).
+
+    ``polar_express`` follows Amsel et al. (norm / 1.01, per-iteration (a,b,c)).
+    ``jordan`` uses the legacy fixed cubic-in-Gram polynomial each step.
+    """
     was_2d = G.ndim == 2
     if was_2d:
         G = G.unsqueeze(0)
@@ -138,11 +173,22 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
     transposed = X.size(-2) > X.size(-1)
     if transposed:
         X = X.mT
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
+    bn = X.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    if ns_backend == "jordan":
+        X = X / bn
+        a, b, c = 3.4445, -4.7750, 2.0315
+        for _ in range(steps):
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    else:
+        X = X / (bn * _NS_SF)
+        n_coeff = len(_POLAR_EXPRESS_COEFFS)
+        for si in range(steps):
+            a, b, c = _POLAR_EXPRESS_COEFFS[si] if si < n_coeff else _POLAR_EXPRESS_COEFFS[-1]
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
     if transposed:
         X = X.mT
     if was_2d:
@@ -160,12 +206,27 @@ class Muon(torch.optim.Optimizer):
     3. Waits for each RS, runs local NS5 on the shard, launches async all-gather
     4. Each all-gather overlaps with next bank's NS5
     """
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
-                 nesterov: bool = True, weight_decay: float = 0.0):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        *,
+        ns_backend: str = "polar_express",
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
-                 nesterov=nesterov, weight_decay=weight_decay),
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+                ns_backend=ns_backend,
+            ),
         )
         self._built = False
 
@@ -268,7 +329,9 @@ class Muon(torch.optim.Optimizer):
                 else:
                     update = buf
 
-                update = zeropower_via_newtonschulz5(update, steps=backend_steps)
+                update = zeropower_via_newtonschulz5(
+                    update, steps=backend_steps, ns_backend=group.get("ns_backend", "polar_express")
+                )
 
                 if sharded:
                     prev_ag_handle = dist.all_gather_into_tensor(
@@ -1691,6 +1754,91 @@ def quantize_int4_blockwise_per_row(t: Tensor, block_size: int) -> tuple[Tensor,
     return packed.contiguous(), scale.contiguous()
 
 
+def quantize_int4_blockwise_asymmetric_per_row(
+    t: Tensor, block_size: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Int4 per column-block with affine map x ≈ q*scale + zp; q in [-8,7], nibble-packed."""
+    t32 = t.float()
+    if t32.ndim == 1:
+        q2, s2, z2 = quantize_int4_blockwise_asymmetric_per_row(t32.unsqueeze(0), block_size)
+        return q2.squeeze(0), s2.squeeze(0), z2.squeeze(0)
+    if t32.ndim != 2:
+        lo = t32.min().item()
+        hi = t32.max().item()
+        scale = max((hi - lo) / 15.0, 1e-8)
+        q = torch.clamp(torch.round((t32 - lo) / scale), -8, 7).to(torch.int8)
+        z = torch.tensor(lo, dtype=torch.float16)
+        sc = torch.tensor(scale, dtype=torch.float16)
+        return q.contiguous(), sc, z
+    nrows, ncols = t32.shape
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    col_widths: list[int] = []
+    c = 0
+    while c < ncols:
+        col_widths.append(min(block_size, ncols - c))
+        c += col_widths[-1]
+    scales_list: list[Tensor] = []
+    zp_list: list[Tensor] = []
+    q_list: list[Tensor] = []
+    for blk in torch.split(t32, col_widths, dim=1):
+        lo = blk.amin(dim=1)
+        hi = blk.amax(dim=1)
+        scale = ((hi - lo) / 15.0).clamp_min(1e-6)
+        qblk = torch.round((blk - lo.unsqueeze(-1)) / scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int8)
+        scales_list.append(scale.to(torch.float16))
+        zp_list.append(lo.to(torch.float16))
+        q_list.append(qblk)
+    scale = torch.stack(scales_list, dim=1)
+    zp = torch.stack(zp_list, dim=1)
+    q_full = torch.cat(q_list, dim=1)
+    pad2 = (2 - q_full.shape[1] % 2) % 2
+    if pad2:
+        q_full = F.pad(q_full, (0, pad2), value=0)
+    q_u = (q_full + 8).to(torch.uint8)
+    packed = (q_u[:, ::2] << 4) | q_u[:, 1::2]
+    return packed.contiguous(), scale.contiguous(), zp.contiguous()
+
+
+def _dequantize_int4_block_asymm_packed_rowwise(
+    packed: Tensor,
+    scales: Tensor,
+    zps: Tensor,
+    nrows: int,
+    ncols: int,
+    block_size: int,
+) -> Tensor:
+    if ncols <= 0:
+        return torch.empty(nrows, 0, dtype=torch.float32, device=packed.device)
+    pad2 = (2 - ncols % 2) % 2
+    nwide = ncols + pad2
+    if packed.shape != (nrows, nwide // 2):
+        raise RuntimeError(
+            f"LQER packed shape {tuple(packed.shape)} != ({nrows},{nwide // 2}) for ncols={ncols}"
+        )
+    q_u = torch.empty(nrows, nwide, dtype=torch.uint8, device=packed.device)
+    q_u[:, ::2] = (packed >> 4) & 0xF
+    q_u[:, 1::2] = packed & 0xF
+    qf = q_u.to(torch.float32) - 8.0
+    qf = qf[:, :ncols]
+    nfull, rem = ncols // block_size, ncols % block_size
+    nblocks_k = nfull + (1 if rem else 0)
+    if scales.shape != (nrows, nblocks_k) or zps.shape != (nrows, nblocks_k):
+        raise RuntimeError(
+            f"LQER scale/zp shape {tuple(scales.shape)}/{tuple(zps.shape)} "
+            f"!= ({nrows},{nblocks_k}) for ncols={ncols} bs={block_size}"
+        )
+    idx = 0
+    parts: list[Tensor] = []
+    for bi in range(nblocks_k):
+        bw = block_size if (rem == 0 or bi < nfull) else rem
+        sc = scales[:, bi : bi + 1].float()
+        zp = zps[:, bi : bi + 1].float()
+        parts.append(qf[:, idx : idx + bw] * sc + zp)
+        idx += bw
+    return torch.cat(parts, dim=1)
+
+
 def _dequantize_int6_block_rowwise(
     q: Tensor,
     scales: Tensor,
@@ -1852,7 +2000,11 @@ def mixed_quantize_int6(
     last_n_int8: int = 0,
     block_size: int = 64,
     skip_name_patterns: tuple[str, ...] = (),
+    lqer_enabled: bool = False,
+    lqer_rank: int = 4,
+    lqer_top_k: int = 3,
 ):
+    lqer_float_cache: dict[str, Tensor] = {}
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
@@ -1906,6 +2058,8 @@ def mixed_quantize_int6(
                 result[name + ".q"] = q
                 result[name + ".scale"] = s
                 meta[name] = {"type": meta_ty, "block_size": block_size if t.ndim in (1, 2) else 0}
+                if lqer_enabled and meta_ty == "int4_block" and t.ndim == 2 and block_size > 0:
+                    lqer_float_cache[name] = t.float().clone()
                 continue
             if cat == "attn" and t.ndim >= 1:
                 q, s = quantize_int6_blockwise_per_row(t, block_size)
@@ -1933,6 +2087,8 @@ def mixed_quantize_int6(
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int4_block", "block_size": block_size if t.ndim in (1, 2) else 0}
+            if lqer_enabled and t.ndim == 2 and block_size > 0:
+                lqer_float_cache[name] = t.float().clone()
         elif use_int6:
             q, s = quantize_int6_blockwise_per_row(t, block_size)
             result[name + ".q"] = q
@@ -1943,7 +2099,63 @@ def mixed_quantize_int6(
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int8"}
+    if lqer_enabled and lqer_float_cache and lqer_top_k > 0 and lqer_rank > 0:
+        errs: list[tuple[float, str]] = []
+        for cname, Wf in lqer_float_cache.items():
+            inf = meta.get(cname)
+            if not isinstance(inf, dict) or inf.get("type") != "int4_block":
+                continue
+            bs0 = int(inf["block_size"])
+            if bs0 <= 0 or f"{cname}.q" not in result:
+                continue
+            nrows, ncols = int(Wf.shape[0]), int(Wf.shape[1])
+            pq = result[f"{cname}.q"]
+            packed = pq.to(torch.uint8) if pq.dtype != torch.uint8 else pq
+            recon0 = _dequantize_int4_block_packed_rowwise(
+                packed, result[f"{cname}.scale"], nrows, ncols, bs0
+            )
+            e = (Wf - recon0).pow(2).sum().sqrt().item()
+            errs.append((e, cname))
+        errs.sort(key=lambda x: -x[0])
+        lq_bs = block_size
+        for _, cname in errs[:lqer_top_k]:
+            Wf = lqer_float_cache[cname]
+            inf = meta[cname]
+            bs0 = int(inf["block_size"])
+            nrows, ncols = int(Wf.shape[0]), int(Wf.shape[1])
+            pq = result[f"{cname}.q"]
+            packed = pq.to(torch.uint8) if pq.dtype != torch.uint8 else pq
+            recon0 = _dequantize_int4_block_packed_rowwise(
+                packed, result[f"{cname}.scale"], nrows, ncols, bs0
+            )
+            R = (Wf - recon0).float()
+            k = min(lqer_rank, nrows, ncols)
+            if k <= 0:
+                continue
+            U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+            k = min(k, int(U.shape[1]), int(S.shape[0]))
+            if k <= 0:
+                continue
+            U = U[:, :k]
+            S = S[:k]
+            Vh = Vh[:k, :]
+            ssqrt = S.sqrt()
+            L = U * ssqrt.unsqueeze(0)
+            Vh_scaled = Vh * ssqrt.unsqueeze(-1)
+            pl, sl, zl = quantize_int4_blockwise_asymmetric_per_row(L, lq_bs)
+            pr, sr, zr = quantize_int4_blockwise_asymmetric_per_row(Vh_scaled, lq_bs)
+            result[f"{cname}.lqer_l.q"] = pl
+            result[f"{cname}.lqer_l.scale"] = sl
+            result[f"{cname}.lqer_l.zp"] = zl
+            result[f"{cname}.lqer_r.q"] = pr
+            result[f"{cname}.lqer_r.scale"] = sr
+            result[f"{cname}.lqer_r.zp"] = zr
+            new_inf = dict(inf)
+            new_inf["lqer"] = {"rank": k}
+            meta[cname] = new_inf
     return result, meta
+
+
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                           template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -1968,6 +2180,16 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             if orig.ndim == 2:
                 nrows, ncols = orig.shape
                 recon = _dequantize_int4_block_packed_rowwise(packed, s, nrows, ncols, bs)
+                lqer = info.get("lqer") if isinstance(info, dict) else None
+                if isinstance(lqer, dict) and f"{name}.lqer_l.q" in result:
+                    rk = int(lqer["rank"])
+                    pl, sl, zl = result[f"{name}.lqer_l.q"], result[f"{name}.lqer_l.scale"], result[f"{name}.lqer_l.zp"]
+                    pr, sr, zr = result[f"{name}.lqer_r.q"], result[f"{name}.lqer_r.scale"], result[f"{name}.lqer_r.zp"]
+                    ppl = pl.to(torch.uint8) if pl.dtype != torch.uint8 else pl
+                    ppr = pr.to(torch.uint8) if pr.dtype != torch.uint8 else pr
+                    Ld = _dequantize_int4_block_asymm_packed_rowwise(ppl, sl, zl, nrows, rk, bs)
+                    Rd = _dequantize_int4_block_asymm_packed_rowwise(ppr, sr, zr, rk, ncols, bs)
+                    recon = recon + (Ld @ Rd)
                 out[name] = recon.to(orig_dtype)
             elif orig.ndim == 1:
                 n = orig.shape[0]
@@ -2021,15 +2243,28 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     n_cuda = torch.cuda.device_count()
-    if local_rank < 0 or local_rank >= n_cuda:
-        raise RuntimeError(
-            f"LOCAL_RANK={local_rank} is invalid: only {n_cuda} CUDA device(s) are visible to this process. "
-            f"Match torchrun --nproc_per_node (and per-node GPU count) to visible devices "
-            f"(check CUDA_VISIBLE_DEVICES / NVIDIA_VISIBLE_DEVICES). "
-            f"rank={rank} WORLD_SIZE={world_size}."
-        )
-    device = torch.device("cuda", local_rank)
+    # Schedulers often expose exactly one physical GPU per process as cuda:0, while
+    # torchrun still sets LOCAL_RANK=0..n-1 on a node. Use LOCAL_RANK only when multiple
+    # devices are visible in this process.
+    if n_cuda == 1:
+        cuda_idx = 0
+    else:
+        if local_rank < 0 or local_rank >= n_cuda:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is invalid: only {n_cuda} CUDA device(s) are visible to this process. "
+                f"Match torchrun --nproc_per_node (and per-node GPU count) to visible devices "
+                f"(check CUDA_VISIBLE_DEVICES / NVIDIA_VISIBLE_DEVICES). "
+                f"rank={rank} WORLD_SIZE={world_size}."
+            )
+        cuda_idx = local_rank
+    device = torch.device("cuda", cuda_idx)
     torch.cuda.set_device(device)
+    if rank == 0 and distributed and n_cuda == 1 and world_size > 1:
+        print(
+            "train_gpt: 1 visible CUDA device per process → all ranks use cuda:0 here "
+            "(normal when each rank's GPU is remapped to index 0).",
+            file=sys.stderr,
+        )
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
@@ -2203,12 +2438,15 @@ def main() -> None:
         fused=True,
     )
     # Matrix banks: FP32 parameter storage; Muon applies updates in FP32 (grad NS path uses BF16 internally).
+    if args.muon_ns_backend not in ("polar_express", "jordan"):
+        raise ValueError(f"MUON_NS_BACKEND must be polar_express or jordan, got {args.muon_ns_backend!r}")
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_wd,
+        ns_backend=args.muon_ns_backend,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -2244,6 +2482,10 @@ def main() -> None:
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(
+        f"muon:ns_backend={args.muon_ns_backend} backend_steps={args.muon_backend_steps} "
+        f"warmdown_min_lr_mul={args.min_lr}"
+    )
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
@@ -2369,7 +2611,7 @@ def main() -> None:
                 )
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms)
+        scale = max(lr_mul(step, elapsed_ms), args.min_lr)
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
@@ -2519,6 +2761,9 @@ def main() -> None:
         last_n_int8=args.gptq_last_n_int8,
         block_size=args.gptq_block_size,
         skip_name_patterns=args.gptq_skip_name_patterns,
+        lqer_enabled=args.lqer_enabled,
+        lqer_rank=args.lqer_rank,
+        lqer_top_k=args.lqer_top_k,
     )
     if master_process:
         log0(
@@ -2531,6 +2776,7 @@ def main() -> None:
             f" int6_last_n={args.gptq_last_n_int6} int6_cats={sorted(args.gptq_int6_cats)}"
             f" int8_last_n={args.gptq_last_n_int8} int8_cats={sorted(args.gptq_int8_cats)}"
             f" skip_patterns={list(args.gptq_skip_name_patterns)}"
+            f" lqer={args.lqer_enabled} lqer_rank={args.lqer_rank} lqer_top_k={args.lqer_top_k}"
         )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
